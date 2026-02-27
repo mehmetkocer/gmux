@@ -868,8 +868,8 @@ static void apply_ui_theme(AppState *app) {
 
     g_string_append(css,
         ".gmux-headerbar { min-height: 28px; padding-top: 2px; padding-bottom: 2px; box-shadow: none; }\n"
-        ".gmux-headerbar button,"
-        ".gmux-headerbar button.flat {"
+        ".gmux-headerbar button:not(.titlebutton),"
+        ".gmux-headerbar button.flat:not(.titlebutton) {"
         "  min-height: 22px; min-width: 22px; padding: 2px; border-radius: 0;"
         "}\n"
         ".gmux-toolbar { padding: 4px 2px; }\n"
@@ -951,10 +951,8 @@ static void apply_ui_theme(AppState *app) {
         ".gmux-headerbar label,"
         ".gmux-headerbar windowtitle label { color: %s; font-size: 0.9em; }\n", s_fg_dim);
     g_string_append_printf(css,
-        ".gmux-headerbar button,"
-        ".gmux-headerbar button.flat,"
-        ".gmux-headerbar windowcontrols button,"
-        ".gmux-headerbar windowcontrols button.flat {"
+        ".gmux-headerbar button:not(.titlebutton),"
+        ".gmux-headerbar button.flat:not(.titlebutton) {"
         "  background-image: none; background-color: transparent;"
         "  color: %s; box-shadow: none;"
         "  min-height: 22px; min-width: 22px;"
@@ -962,7 +960,7 @@ static void apply_ui_theme(AppState *app) {
         "  border-radius: 0;"
         "}\n", s_fg_dim);
     g_string_append_printf(css,
-        ".gmux-headerbar button:hover {"
+        ".gmux-headerbar button:not(.titlebutton):hover {"
         "  background-color: %s;"
         "}\n", s_hover);
 
@@ -2223,13 +2221,18 @@ static void activate(GtkApplication *app, gpointer user_data) {
     // Create window
     state->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(state->window), "gmux");
+    gtk_window_set_icon_name(GTK_WINDOW(state->window), "utilities-terminal");
     gtk_window_set_default_size(GTK_WINDOW(state->window), 1200, 800);
     load_window_geometry(state);
 
-    // Create explicit headerbar so we can style it
-    GtkWidget *headerbar = gtk_header_bar_new();
-    gtk_widget_add_css_class(headerbar, "gmux-headerbar");
-    gtk_window_set_titlebar(GTK_WINDOW(state->window), headerbar);
+    // Create explicit headerbar so we can style it (skip on KDE — it forces SSD)
+    const char *desktop = g_getenv("XDG_CURRENT_DESKTOP");
+    gboolean is_kde = desktop && g_strstr_len(desktop, -1, "KDE") != NULL;
+    if (!is_kde) {
+        GtkWidget *headerbar = gtk_header_bar_new();
+        gtk_widget_add_css_class(headerbar, "gmux-headerbar");
+        gtk_window_set_titlebar(GTK_WINDOW(state->window), headerbar);
+    }
 
     // Create horizontal paned
     GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
