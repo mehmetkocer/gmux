@@ -1,8 +1,8 @@
 # gmux - GTK4 Terminal Multiplexer
 
-**Status: ✅ Working**
-
 A modern terminal multiplexer built with GTK4 and VTE, featuring vertical tabs and planned project management capabilities.
+
+![gmux screenshot](screenshot.png)
 
 ## Quick Start
 
@@ -24,13 +24,13 @@ gmux provides a clean tabbed terminal interface with:
 
 ## Current Features
 
-✅ Vertical tabs with terminal list
-✅ Add/remove terminals
-✅ Full VTE terminal emulation
-✅ 10,000 lines scrollback
-✅ Mouse support
-✅ Dynamic tab titles
-✅ Stable and crash-free
+- Vertical tabs with terminal list
+- Add/remove terminals
+- Full VTE terminal emulation
+- 10,000 lines scrollback
+- Mouse support
+- Dynamic tab titles
+- Stable and crash-free
 
 ## Requirements
 
