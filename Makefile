@@ -18,10 +18,12 @@ clean:
 install: $(TARGET)
 	install -D -m 755 $(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
 	install -D -m 644 gmux.desktop $(DESTDIR)/usr/local/share/applications/gmux.desktop
+	install -D -m 644 gmux.svg $(DESTDIR)/usr/local/share/icons/hicolor/scalable/apps/gmux.svg
 
 uninstall:
 	rm -f $(DESTDIR)/usr/local/bin/$(TARGET)
 	rm -f $(DESTDIR)/usr/local/share/applications/gmux.desktop
+	rm -f $(DESTDIR)/usr/local/share/icons/hicolor/scalable/apps/gmux.svg
 
 run: $(TARGET)
 	./$(TARGET)
