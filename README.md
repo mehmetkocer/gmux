@@ -34,9 +34,17 @@ gmux provides a clean tabbed terminal interface with:
 
 ## Requirements
 
+Ubuntu/gnome
 ```bash
-sudo apt install build-essential pkg-config
-sudo apt install libgtk-4-dev libvte-2.91-gtk4-dev
+apt install build-essential pkg-config
+apt install libgtk-4-dev libvte-2.91-gtk4-dev
+```
+
+Fedora/kde
+```bash
+dnf install build-essential pkg-config
+dnf install libgtk-4-dev libvte-2.91-gtk4-dev
+dnf install gtk4-devel vte291-gtk4-devel json-glib-devel
 ```
 
 ## Building
