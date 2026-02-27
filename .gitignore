@@ -1,0 +1,15 @@
+# Build artifacts
+gmux
+*.o
+build/
+builddir/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

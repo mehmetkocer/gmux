@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=gmux
+GenericName=Terminal Multiplexer
+Comment=GTK4 terminal multiplexer with vertical tabs for Ghostty
+Exec=gmux
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;ghostty;multiplexer;tabs;
