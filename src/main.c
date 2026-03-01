@@ -73,9 +73,12 @@ typedef struct {
 struct _SubTab {
     VteTerminal *terminal;
     GtkWidget *scrolled;
+    GtkWidget *tab_widget;
     GtkWidget *tab_button;
+    GtkWidget *tab_label;
     char *name;
     Project *parent_tab;
+    gboolean closing;
 };
 
 struct _Project {
@@ -878,20 +881,26 @@ static void apply_ui_theme(AppState *app) {
         "  min-height: 40px; min-width: 40px;"
         "}\n"
         ".gmux-tab-header { padding: 0; }\n"
+        ".gmux-tab-item { margin: 0; padding: 0; spacing: 0; border-radius: 0; }\n"
+        ".gmux-tab-item-active { background-color: alpha(@theme_selected_bg_color, 0.55); }\n"
+        ".gmux-tab-item-active > button { color: @theme_selected_fg_color; }\n"
+        ".gmux-tab-header > box > .gmux-tab-item > button,"
         ".gmux-tab-header > box > button,"
         ".gmux-tab-header > button {"
-        "  border-radius: 0; padding: 3px 8px; margin: 0;"
+        "  background: none; border: none; box-shadow: none;"
+        "  border-radius: 0; padding: 3px 8px; margin: 0; min-height: 28px;"
         "  font-size: 0.85em;"
         "}\n"
         ".gmux-tab-close {"
         "  background: none; border: none; box-shadow: none;"
-        "  min-height: 16px; min-width: 16px;"
-        "  max-height: 16px; max-width: 16px;"
-        "  padding: 2px; margin: 0;"
+        "  min-height: 28px; min-width: 22px;"
+        "  max-height: 28px; max-width: 22px;"
+        "  padding: 3px 6px; margin: 0;"
         "  opacity: 0.4; border-radius: 3px;"
         "  -gtk-icon-size: 12px;"
         "}\n"
-        ".gmux-tab-close:hover { opacity: 1.0; }\n"
+        ".gmux-tab-item-active > .gmux-tab-close { opacity: 0.75; }\n"
+        ".gmux-tab-close:hover { opacity: 1.0; background-color: alpha(@theme_fg_color, 0.16); }\n"
         ".gmux-tab-dragging { opacity: 0.5; }\n"
         "window.background.csd,"
         "window.background.csd decoration { border-radius: 0; }\n"
@@ -1034,29 +1043,39 @@ static void apply_ui_theme(AppState *app) {
         "  padding: 0;"
         "}\n", s_sidebar, s_fg);
     g_string_append_printf(css,
+        ".gmux-tab-item {"
+        "  margin: 0; padding: 0; spacing: 0; border-radius: 0;"
+        "  transition: background-color 150ms ease;"
+        "}\n");
+    g_string_append_printf(css,
+        ".gmux-tab-item-active { background-color: %s; }\n", s_accent);
+    g_string_append_printf(css,
+        ".gmux-tab-item-active > button { color: %s; }\n", s_fg);
+    g_string_append_printf(css,
+        ".gmux-tab-header > box > .gmux-tab-item > button,"
         ".gmux-tab-header > box > button,"
         ".gmux-tab-header > button {"
         "  background: none; color: %s; border: none; box-shadow: none;"
-        "  border-radius: 0; padding: 3px 8px; margin: 0;"
+        "  border-radius: 0; padding: 3px 8px; margin: 0; min-height: 28px;"
         "  font-size: 0.85em;"
-        "  transition: background-color 150ms ease;"
         "}\n", s_fg_dim);
     g_string_append_printf(css,
-        ".gmux-tab-header > box > button:hover { background-color: alpha(%s, 0.1); }\n", s_fg);
-    g_string_append_printf(css,
-        ".gmux-tab-header > box > button.suggested-action {"
-        "  background-color: %s; color: %s; border-radius: 0;"
-        "}\n", s_accent, s_fg);
+        ".gmux-tab-header > box > .gmux-tab-item > button:hover,"
+        ".gmux-tab-header > box > button:hover { background-color: transparent; }\n");
     g_string_append_printf(css,
         ".gmux-tab-close {"
         "  background: none; border: none; box-shadow: none;"
-        "  min-height: 16px; min-width: 16px;"
-        "  max-height: 16px; max-width: 16px;"
-        "  padding: 2px; margin: 0;"
+        "  min-height: 28px; min-width: 22px;"
+        "  max-height: 28px; max-width: 22px;"
+        "  padding: 3px 6px; margin: 0;"
         "  opacity: 0.4;"
         "  border-radius: 3px;"
         "  color: %s;"
         "  -gtk-icon-size: 12px;"
+        "}\n", s_fg);
+    g_string_append_printf(css,
+        ".gmux-tab-item-active > .gmux-tab-close {"
+        "  background-color: transparent; color: %s; opacity: 0.75;"
         "}\n", s_fg);
     g_string_append_printf(css,
         ".gmux-tab-close:hover { opacity: 1.0; background-color: alpha(%s, 0.2); }\n", s_fg);
@@ -1519,11 +1538,8 @@ static void on_terminal_title_changed(VteTerminal *terminal, gpointer user_data)
         g_free(subtab->name);
         subtab->name = g_strdup(title);
 
-        // Update tab button label (first child of the box inside the button)
-        GtkWidget *tab_box = gtk_button_get_child(GTK_BUTTON(subtab->tab_button));
-        GtkWidget *label = gtk_widget_get_first_child(tab_box);
-        if (label && GTK_IS_LABEL(label)) {
-            gtk_label_set_text(GTK_LABEL(label), subtab->name);
+        if (subtab->tab_label && GTK_IS_LABEL(subtab->tab_label)) {
+            gtk_label_set_text(GTK_LABEL(subtab->tab_label), subtab->name);
         }
     }
 }
@@ -1532,6 +1548,10 @@ static void on_terminal_child_exited(VteTerminal *terminal, int status, gpointer
     SubTab *subtab = (SubTab *)user_data;
     (void)status;
     (void)terminal;
+
+    if (subtab->closing) {
+        return;
+    }
 
     printf("Terminal '%s' child process exited\n", subtab->name);
 
@@ -1552,14 +1572,16 @@ static void on_subtab_button_clicked(GtkButton *button, gpointer user_data) {
     gtk_stack_set_visible_child(GTK_STACK(project->terminal_stack), subtab->scrolled);
     project->active_subtab = subtab;
 
-    // Update button styles - make this one look active
+    // Update tab styles - active state is on the whole tab row
     for (GList *l = project->subtabs; l != NULL; l = l->next) {
         SubTab *st = (SubTab *)l->data;
+        GtkWidget *row = st->tab_widget;
         GtkWidget *btn = st->tab_button;
+        if (!row || !btn) continue;
         if (st == subtab) {
-            gtk_widget_add_css_class(btn, "suggested-action");
+            gtk_widget_add_css_class(row, "gmux-tab-item-active");
         } else {
-            gtk_widget_remove_css_class(btn, "suggested-action");
+            gtk_widget_remove_css_class(row, "gmux-tab-item-active");
         }
     }
 
@@ -1583,10 +1605,17 @@ static void update_tab_count_badge(Project *project) {
 }
 
 static void close_subtab(SubTab *subtab) {
-    Project *project = subtab->parent_tab;
+    if (!subtab || subtab->closing) {
+        return;
+    }
+    subtab->closing = TRUE;
 
-    // Don't close the last tab — spawn a fresh one instead
+    Project *project = subtab->parent_tab;
     gboolean was_last = (g_list_length(project->subtabs) == 1);
+
+    if (subtab->terminal) {
+        g_signal_handlers_disconnect_by_data(subtab->terminal, subtab);
+    }
 
     // If this was the active subtab, switch to an adjacent one first
     if (project->active_subtab == subtab && !was_last) {
@@ -1599,7 +1628,7 @@ static void close_subtab(SubTab *subtab) {
     }
 
     // Remove tab button from header
-    gtk_box_remove(GTK_BOX(project->tabs_box), subtab->tab_button);
+    gtk_box_remove(GTK_BOX(project->tabs_box), subtab->tab_widget);
 
     // Remove terminal from stack
     gtk_stack_remove(GTK_STACK(project->terminal_stack), subtab->scrolled);
@@ -1609,16 +1638,18 @@ static void close_subtab(SubTab *subtab) {
 
     printf("Closed subtab: %s\n", subtab->name);
 
+    // If this was the active tab and no adjacent tab was selected, clear active state
+    if (project->active_subtab == subtab) {
+        project->active_subtab = NULL;
+    }
+
     // Free subtab resources
     g_free(subtab->name);
     g_free(subtab);
 
-    // If that was the last tab, create a replacement
+    // Mark as uninitialized when all tabs are closed; tab creation remains lazy.
     if (was_last) {
-        project->subtab_counter++;
-        char name_buf[64];
-        snprintf(name_buf, sizeof(name_buf), "Tab %d", project->subtab_counter);
-        create_subtab(project, name_buf, project->path);
+        project->initialized = FALSE;
     }
 
     update_tab_count_badge(project);
@@ -1674,6 +1705,15 @@ static GtkWidget *find_tab_button_ancestor(GtkWidget *widget, GtkWidget *tabs_bo
     return NULL;
 }
 
+static gboolean is_close_button_hit(GtkWidget *widget, GtkWidget *tabs_box) {
+    while (widget && widget != tabs_box) {
+        if (gtk_widget_has_css_class(widget, "gmux-tab-close"))
+            return TRUE;
+        widget = gtk_widget_get_parent(widget);
+    }
+    return FALSE;
+}
+
 static void rebuild_subtabs_list(Project *project) {
     g_list_free(project->subtabs);
     project->subtabs = NULL;
@@ -1690,6 +1730,12 @@ static void on_tab_drag_begin(GtkGestureDrag *gesture, double start_x, double st
     Project *project = (Project *)user_data;
 
     GtkWidget *picked = gtk_widget_pick(project->tabs_box, start_x, start_y, GTK_PICK_DEFAULT);
+    if (is_close_button_hit(picked, project->tabs_box)) {
+        // Let close button clicks pass through untouched.
+        gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
+        return;
+    }
+
     GtkWidget *tab_btn = find_tab_button_ancestor(picked, project->tabs_box);
     if (!tab_btn) {
         gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_DENIED);
@@ -1800,12 +1846,6 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
     g_signal_connect(click, "pressed", G_CALLBACK(on_terminal_clicked), subtab->terminal);
     gtk_widget_add_controller(GTK_WIDGET(subtab->terminal), GTK_EVENT_CONTROLLER(click));
 
-    // Apply theme + settings overrides
-    if (project->app->theme.loaded) {
-        apply_theme(subtab->terminal, &project->app->theme);
-    }
-    apply_settings_overrides(project->app);
-
     // Make terminal scrollable
     subtab->scrolled = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(subtab->scrolled),
@@ -1825,11 +1865,16 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
     // Add to stack
     gtk_stack_add_child(GTK_STACK(project->terminal_stack), subtab->scrolled);
 
-    // Create tab button with close button inside
+    // Create tab row with separate select and close buttons
+    subtab->tab_widget = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(subtab->tab_widget, "gmux-tab-item");
+
     subtab->tab_button = gtk_button_new();
-    GtkWidget *tab_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *tab_label = gtk_label_new(name);
-    gtk_box_append(GTK_BOX(tab_box), tab_label);
+    subtab->tab_label = gtk_label_new(name);
+    gtk_button_set_child(GTK_BUTTON(subtab->tab_button), subtab->tab_label);
+    g_signal_connect(subtab->tab_button, "clicked",
+                     G_CALLBACK(on_subtab_button_clicked), subtab);
+    gtk_box_append(GTK_BOX(subtab->tab_widget), subtab->tab_button);
 
     GtkWidget *close_btn = gtk_button_new_from_icon_name("window-close-symbolic");
     gtk_widget_add_css_class(close_btn, "gmux-tab-close");
@@ -1837,15 +1882,12 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
     gtk_widget_set_focus_on_click(close_btn, FALSE);
     g_signal_connect(close_btn, "clicked",
                      G_CALLBACK(on_close_subtab_clicked), subtab);
-    gtk_box_append(GTK_BOX(tab_box), close_btn);
+    gtk_box_append(GTK_BOX(subtab->tab_widget), close_btn);
 
-    gtk_button_set_child(GTK_BUTTON(subtab->tab_button), tab_box);
-    g_signal_connect(subtab->tab_button, "clicked",
-                     G_CALLBACK(on_subtab_button_clicked), subtab);
-    gtk_box_append(GTK_BOX(project->tabs_box), subtab->tab_button);
+    gtk_box_append(GTK_BOX(project->tabs_box), subtab->tab_widget);
 
     // Store subtab pointer on the button for drag-reorder lookups
-    g_object_set_data(G_OBJECT(subtab->tab_button), "subtab", subtab);
+    g_object_set_data(G_OBJECT(subtab->tab_widget), "subtab", subtab);
 
     // Spawn shell in terminal
     char *argv[] = { g_strdup(g_getenv("SHELL") ?: "/bin/bash"), NULL };
@@ -1869,8 +1911,34 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
 
     project->subtabs = g_list_append(project->subtabs, subtab);
 
-    // Switch to this subtab
+    // Switch to this subtab first (so it's visible/realized)
     on_subtab_button_clicked(GTK_BUTTON(subtab->tab_button), subtab);
+
+    // Apply theme + settings AFTER terminal is in widget tree, visible, and realized
+    if (project->app->theme.loaded) {
+        apply_theme(subtab->terminal, &project->app->theme);
+    }
+    {
+        TerminalSettings *s = &project->app->settings;
+        if (s->font_family || s->font_size > 0) {
+            PangoFontDescription *fd = pango_font_description_new();
+            if (s->font_family)
+                pango_font_description_set_family(fd, s->font_family);
+            if (s->font_size > 0)
+                pango_font_description_set_size(fd, (int)(s->font_size * PANGO_SCALE));
+            vte_terminal_set_font(subtab->terminal, fd);
+            pango_font_description_free(fd);
+        }
+        if (s->opacity < 1.0 && project->app->theme.loaded) {
+            GdkRGBA bg = project->app->theme.background;
+            bg.alpha = s->opacity;
+            vte_terminal_set_color_background(subtab->terminal, &bg);
+        }
+        if (s->cursor_shape >= 0)
+            vte_terminal_set_cursor_shape(subtab->terminal, (VteCursorShape)s->cursor_shape);
+        if (s->cursor_blink >= 0)
+            vte_terminal_set_cursor_blink_mode(subtab->terminal, (VteCursorBlinkMode)s->cursor_blink);
+    }
 
     printf("Created subtab: %s\n", name);
 
