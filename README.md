@@ -14,6 +14,37 @@ make
 ./gmux
 ```
 
+## Install
+
+```bash
+# Build and install to /usr/local/bin/gmux
+sudo make install
+```
+
+`make install` now rebuilds `gmux` from the current sources before copying it, including header changes under `src/`, so the installed binary stays in sync with the latest local code.
+
+Installed files:
+
+- `/usr/local/bin/gmux`
+- `/usr/local/share/applications/gmux.desktop`
+- `/usr/local/share/icons/hicolor/scalable/apps/gmux.svg`
+
+Useful commands:
+
+```bash
+# Check which gmux is being launched
+command -v gmux
+
+# Print the installed build identity
+gmux --version
+
+# Compare installed binary with the local build
+sha256sum ./gmux "$(command -v gmux)"
+
+# Remove the system install
+sudo make uninstall
+```
+
 ## What is gmux?
 
 gmux provides a clean tabbed terminal interface with:
@@ -52,8 +83,6 @@ dnf install gtk4-devel vte291-gtk4-devel json-glib-devel
 ```bash
 make
 ```
-
-The binary will be `gmux` (28KB).
 
 ## Usage
 

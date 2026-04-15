@@ -1,6 +1,7 @@
 # Build artifacts
 gmux
 *.o
+*.d
 build/
 builddir/
 

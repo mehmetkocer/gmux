@@ -7,8 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdarg.h>
+#include <string.h>
 #include <json-glib/json-glib.h>
 #include "themes.h"
+
+#ifndef GMUX_VERSION
+#define GMUX_VERSION "dev"
+#endif
+
+#ifndef GMUX_GIT_COMMIT
+#define GMUX_GIT_COMMIT "unknown"
+#endif
 
 typedef struct _SubTab SubTab;
 typedef struct _Project Project;
@@ -39,6 +49,10 @@ typedef struct {
     double opacity;       // 0.0-1.0, default 1.0
     int cursor_shape;     // -1 = profile, 0=block, 1=ibeam, 2=underline
     int cursor_blink;     // -1 = profile, 0=system, 1=on, 2=off
+    char *day_theme_name;
+    char *night_theme_name;
+    int day_start_minutes;
+    int night_start_minutes;
 } TerminalSettings;
 
 typedef enum {
@@ -49,6 +63,7 @@ typedef enum {
 
 typedef struct {
     GtkWidget *window;
+    GtkWidget *settings_dialog;
     GtkWidget *sidebar;
     GtkWidget *notebook;
     GtkWidget *sidebar_box;
@@ -58,6 +73,10 @@ typedef struct {
     TerminalSettings settings;
     char *theme_name;
     GtkCssProvider *css_provider;
+    guint theme_schedule_timer_id;
+    guint theme_refresh_idle_id;
+    gboolean theme_preview_active;
+    gboolean settings_dialog_closing;
     int last_width;
     int last_height;
     gboolean last_maximized;
@@ -72,7 +91,7 @@ typedef struct {
 
 struct _SubTab {
     VteTerminal *terminal;
-    GtkWidget *scrolled;
+    GtkWidget *container;
     GtkWidget *tab_widget;
     GtkWidget *tab_button;
     GtkWidget *tab_label;
@@ -85,7 +104,11 @@ struct _Project {
     GtkWidget *list_row;
     GtkWidget *tab_container;
     GtkWidget *tab_header;
+    GtkWidget *tabs_scroller;
     GtkWidget *tabs_box;
+    GtkWidget *tabs_scrollbar;
+    GtkAdjustment *tabs_hadjustment;
+    GtkWidget *tabs_overflow_indicator;
     GtkWidget *terminal_stack;
     GList *subtabs;
     SubTab *active_subtab;
@@ -104,10 +127,33 @@ struct _Project {
 static Project* create_project(AppState *app, const char *name, const char *path, gboolean init_terminal);
 static SubTab* create_subtab(Project *project, const char *name, const char *working_dir);
 static void close_subtab(SubTab *subtab);
+static void apply_theme_to_all_terminals(AppState *app);
 static void on_subtab_button_clicked(GtkButton *button, gpointer user_data);
+static void sync_terminal_size_from_widget(SubTab *subtab);
 static char* get_sort_config_path(void);
 static void on_project_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
 static void setup_tabs_box_drag_reorder(Project *project);
+static void update_tab_overflow_indicator(Project *project);
+static void scroll_subtab_into_view(Project *project, SubTab *subtab);
+
+static const char* gmux_build_version(void) {
+    return "gmux " GMUX_VERSION " (" GMUX_GIT_COMMIT ", built " __DATE__ " " __TIME__ ")";
+}
+static const ThemePreset* find_builtin_theme(const char *name);
+static void apply_theme_name_now(AppState *app, const char *name);
+static void apply_ui_theme(AppState *app);
+static void refresh_scheduled_theme(AppState *app);
+static void queue_theme_refresh(AppState *app);
+
+static void debug_log(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    printf("[gmux-debug %lld] ", (long long)(g_get_monotonic_time() / 1000));
+    vprintf(fmt, args);
+    printf("\n");
+    fflush(stdout);
+    va_end(args);
+}
 
 //=============================================================================
 // Config Persistence
@@ -548,6 +594,44 @@ static char* get_settings_config_path(void) {
     return path;
 }
 
+static int clamp_minutes(int minutes) {
+    if (minutes < 0) return 0;
+    if (minutes > (23 * 60 + 59)) return 23 * 60 + 59;
+    return minutes;
+}
+
+static gboolean parse_time_value(const char *value, int *minutes_out) {
+    int hour = 0, minute = 0;
+
+    if (!value || !minutes_out) return FALSE;
+    if (sscanf(value, "%d:%d", &hour, &minute) != 2) return FALSE;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return FALSE;
+
+    *minutes_out = hour * 60 + minute;
+    return TRUE;
+}
+
+static const char* get_default_theme_name_for_variant(const char *preferred_name,
+                                                      const char *variant) {
+    if (preferred_name && find_builtin_theme(preferred_name))
+        return preferred_name;
+
+    for (size_t i = 0; i < BUILTIN_THEME_COUNT; i++) {
+        if (g_strcmp0(builtin_themes[i].variant, variant) == 0)
+            return builtin_themes[i].name;
+    }
+
+    return builtin_themes[0].name;
+}
+
+static const char* get_default_day_theme_name(void) {
+    return get_default_theme_name_for_variant("Nord Light", "light");
+}
+
+static const char* get_default_night_theme_name(void) {
+    return get_default_theme_name_for_variant("Dracula", "dark");
+}
+
 static void save_terminal_settings(TerminalSettings *s) {
     char *path = get_settings_config_path();
     FILE *fp = fopen(path, "w");
@@ -564,6 +648,14 @@ static void save_terminal_settings(TerminalSettings *s) {
         fprintf(fp, "cursor_shape=%d\n", s->cursor_shape);
     if (s->cursor_blink >= 0)
         fprintf(fp, "cursor_blink=%d\n", s->cursor_blink);
+    if (s->day_theme_name)
+        fprintf(fp, "day_theme=%s\n", s->day_theme_name);
+    if (s->night_theme_name)
+        fprintf(fp, "night_theme=%s\n", s->night_theme_name);
+    fprintf(fp, "day_start=%02d:%02d\n",
+            s->day_start_minutes / 60, s->day_start_minutes % 60);
+    fprintf(fp, "night_start=%02d:%02d\n",
+            s->night_start_minutes / 60, s->night_start_minutes % 60);
 
     fclose(fp);
 }
@@ -575,11 +667,30 @@ static void load_terminal_settings(TerminalSettings *s) {
     s->opacity = 1.0;
     s->cursor_shape = -1;
     s->cursor_blink = -1;
+    s->day_theme_name = g_strdup(get_default_day_theme_name());
+    s->night_theme_name = g_strdup(get_default_night_theme_name());
+    s->day_start_minutes = 7 * 60 + 30;
+    s->night_start_minutes = 20 * 60;
 
     char *path = get_settings_config_path();
     FILE *fp = fopen(path, "r");
     g_free(path);
-    if (!fp) return;
+    if (!fp) {
+        char *legacy_theme = load_theme_name();
+        if (legacy_theme) {
+            const ThemePreset *legacy_preset = find_builtin_theme(legacy_theme);
+            if (legacy_preset && g_strcmp0(legacy_preset->variant, "light") == 0) {
+                g_free(s->day_theme_name);
+                s->day_theme_name = legacy_theme;
+            } else if (legacy_preset && g_strcmp0(legacy_preset->variant, "dark") == 0) {
+                g_free(s->night_theme_name);
+                s->night_theme_name = legacy_theme;
+            } else {
+                g_free(legacy_theme);
+            }
+        }
+        return;
+    }
 
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
@@ -606,9 +717,30 @@ static void load_terminal_settings(TerminalSettings *s) {
             s->cursor_shape = atoi(val);
         } else if (strcmp(key, "cursor_blink") == 0) {
             s->cursor_blink = atoi(val);
+        } else if (strcmp(key, "day_theme") == 0) {
+            if (find_builtin_theme(val)) {
+                g_free(s->day_theme_name);
+                s->day_theme_name = g_strdup(val);
+            }
+        } else if (strcmp(key, "night_theme") == 0) {
+            if (find_builtin_theme(val)) {
+                g_free(s->night_theme_name);
+                s->night_theme_name = g_strdup(val);
+            }
+        } else if (strcmp(key, "day_start") == 0) {
+            int minutes = 0;
+            if (parse_time_value(val, &minutes))
+                s->day_start_minutes = minutes;
+        } else if (strcmp(key, "night_start") == 0) {
+            int minutes = 0;
+            if (parse_time_value(val, &minutes))
+                s->night_start_minutes = minutes;
         }
     }
     fclose(fp);
+
+    s->day_start_minutes = clamp_minutes(s->day_start_minutes);
+    s->night_start_minutes = clamp_minutes(s->night_start_minutes);
 }
 
 //=============================================================================
@@ -622,13 +754,39 @@ static char* get_sort_config_path(void) {
     return path;
 }
 
+static int compare_project_tiebreak(Project *p1, Project *p2,
+                                    GtkListBoxRow *row1, GtkListBoxRow *row2) {
+    if (p1 == p2 || row1 == row2) {
+        return 0;
+    }
+
+    int name_result = g_ascii_strcasecmp(p1->name, p2->name);
+    if (name_result != 0) {
+        return name_result;
+    }
+
+    int path_result = g_strcmp0(p1->path, p2->path);
+    if (path_result != 0) {
+        return path_result;
+    }
+
+    if (p1->insert_order != p2->insert_order) {
+        return p1->insert_order < p2->insert_order ? -1 : 1;
+    }
+
+    return ((guintptr)row1 < (guintptr)row2) ? -1 : 1;
+}
+
 static int sort_func_insertion(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointer user_data) {
     (void)user_data;
     Project *p1 = (Project *)g_object_get_data(G_OBJECT(row1), "project");
     Project *p2 = (Project *)g_object_get_data(G_OBJECT(row2), "project");
     if (!p1 || !p2) return 0;
     printf("[sort] insertion: %s(%d) vs %s(%d)\n", p1->name, p1->insert_order, p2->name, p2->insert_order);
-    return p1->insert_order - p2->insert_order;
+    if (p1->insert_order != p2->insert_order) {
+        return p1->insert_order < p2->insert_order ? -1 : 1;
+    }
+    return compare_project_tiebreak(p1, p2, row1, row2);
 }
 
 static int sort_func_alpha(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointer user_data) {
@@ -637,6 +795,9 @@ static int sort_func_alpha(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointer us
     Project *p2 = (Project *)g_object_get_data(G_OBJECT(row2), "project");
     if (!p1 || !p2) return 0;
     int result = g_ascii_strcasecmp(p1->name, p2->name);
+    if (result == 0) {
+        result = compare_project_tiebreak(p1, p2, row1, row2);
+    }
     printf("[sort] alpha: %s vs %s = %d\n", p1->name, p2->name, result);
     return result;
 }
@@ -650,7 +811,7 @@ static int sort_func_mru(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointer user
     // Descending: most recent first
     if (p2->last_used > p1->last_used) result = 1;
     else if (p2->last_used < p1->last_used) result = -1;
-    else result = 0;
+    else result = compare_project_tiebreak(p1, p2, row1, row2);
     printf("[sort] mru: %s(%" G_GINT64_FORMAT ") vs %s(%" G_GINT64_FORMAT ") = %d\n",
            p1->name, p1->last_used, p2->name, p2->last_used, result);
     return result;
@@ -731,6 +892,72 @@ static const ThemePreset* find_builtin_theme(const char *name) {
     return NULL;
 }
 
+static gboolean is_day_theme_active(const TerminalSettings *settings, int minutes_now) {
+    int day_start = clamp_minutes(settings->day_start_minutes);
+    int night_start = clamp_minutes(settings->night_start_minutes);
+
+    if (day_start == night_start) return TRUE;
+    if (day_start < night_start)
+        return minutes_now >= day_start && minutes_now < night_start;
+
+    return minutes_now >= day_start || minutes_now < night_start;
+}
+
+static const char* get_scheduled_theme_name(const TerminalSettings *settings, int minutes_now) {
+    return is_day_theme_active(settings, minutes_now)
+        ? settings->day_theme_name
+        : settings->night_theme_name;
+}
+
+static gboolean is_day_theme_active_now(const TerminalSettings *settings) {
+    GDateTime *now = g_date_time_new_now_local();
+    int minutes_now = g_date_time_get_hour(now) * 60 + g_date_time_get_minute(now);
+    gboolean day_active = is_day_theme_active(settings, minutes_now);
+    g_date_time_unref(now);
+    return day_active;
+}
+
+static gboolean on_theme_refresh_idle(gpointer user_data) {
+    AppState *app = (AppState *)user_data;
+    debug_log("theme_refresh_idle begin preview=%d current=%s",
+              app->theme_preview_active,
+              app->theme_name ? app->theme_name : "(null)");
+    app->theme_refresh_idle_id = 0;
+    refresh_scheduled_theme(app);
+    debug_log("theme_refresh_idle end current=%s",
+              app->theme_name ? app->theme_name : "(null)");
+    return G_SOURCE_REMOVE;
+}
+
+static void queue_theme_refresh(AppState *app) {
+    if (app->settings_dialog_closing) {
+        debug_log("queue_theme_refresh skipped settings_dialog_closing=1");
+        return;
+    }
+    if (app->theme_refresh_idle_id != 0) {
+        debug_log("queue_theme_refresh skipped existing_idle=%u", app->theme_refresh_idle_id);
+        return;
+    }
+
+    app->theme_refresh_idle_id = g_idle_add(on_theme_refresh_idle, app);
+    debug_log("queue_theme_refresh queued idle=%u", app->theme_refresh_idle_id);
+}
+
+static gboolean on_theme_schedule_tick(gpointer user_data) {
+    AppState *app = (AppState *)user_data;
+    if (app->theme_preview_active) {
+        debug_log("theme_schedule_tick skipped preview_active=1");
+        return G_SOURCE_CONTINUE;
+    }
+    if (app->settings_dialog_closing) {
+        debug_log("theme_schedule_tick skipped settings_dialog_closing=1");
+        return G_SOURCE_CONTINUE;
+    }
+    debug_log("theme_schedule_tick queueing refresh");
+    queue_theme_refresh(app);
+    return G_SOURCE_CONTINUE;
+}
+
 static void load_builtin_theme(AppState *app, const char *name) {
     const ThemePreset *preset = find_builtin_theme(name);
     if (!preset) {
@@ -769,6 +996,27 @@ static void load_builtin_theme(AppState *app, const char *name) {
     printf("Loaded built-in theme: %s\n", name);
 }
 
+static void apply_theme_name_now(AppState *app, const char *name) {
+    debug_log("apply_theme_name_now target=%s current=%s preview=%d",
+              name ? name : "(null)",
+              app->theme_name ? app->theme_name : "(null)",
+              app->theme_preview_active);
+    if (app->settings_dialog_closing) {
+        debug_log("apply_theme_name_now skipped settings_dialog_closing=1");
+        return;
+    }
+    if (!name || !find_builtin_theme(name))
+        return;
+
+    if (g_strcmp0(app->theme_name, name) == 0)
+        return;
+
+    load_builtin_theme(app, name);
+    save_theme_name(name);
+    apply_theme_to_all_terminals(app);
+    apply_ui_theme(app);
+}
+
 static void apply_theme(VteTerminal *terminal, TerminalTheme *theme) {
     if (!theme->loaded) return;
 
@@ -801,6 +1049,7 @@ static void apply_theme(VteTerminal *terminal, TerminalTheme *theme) {
 }
 
 static void apply_settings_overrides(AppState *app);
+static void apply_theme_to_all_terminals(AppState *app);
 
 static void apply_theme_to_all_terminals(AppState *app) {
     for (GList *l = app->projects; l != NULL; l = l->next) {
@@ -811,6 +1060,23 @@ static void apply_theme_to_all_terminals(AppState *app) {
         }
     }
     apply_settings_overrides(app);
+}
+
+static void refresh_scheduled_theme(AppState *app) {
+    GDateTime *now = g_date_time_new_now_local();
+    int minutes_now = g_date_time_get_hour(now) * 60 + g_date_time_get_minute(now);
+    const char *name = get_scheduled_theme_name(&app->settings, minutes_now);
+    debug_log("refresh_scheduled_theme now=%02d:%02d chosen=%s current=%s preview=%d",
+              g_date_time_get_hour(now), g_date_time_get_minute(now),
+              name ? name : "(null)",
+              app->theme_name ? app->theme_name : "(null)",
+              app->theme_preview_active);
+    g_date_time_unref(now);
+
+    if (!name || !find_builtin_theme(name))
+        name = get_default_night_theme_name();
+
+    apply_theme_name_now(app, name);
 }
 
 static void apply_settings_overrides(AppState *app) {
@@ -881,12 +1147,14 @@ static void apply_ui_theme(AppState *app) {
         "  min-height: 40px; min-width: 40px;"
         "}\n"
         ".gmux-tab-header { padding: 0; }\n"
-        ".gmux-tab-item { margin: 0; padding: 0; spacing: 0; border-radius: 0; }\n"
+        ".gmux-tabs-scroller, .gmux-tabs-scroller > viewport { background: none; border: none; }\n"
+        ".gmux-tab-scrollbar { min-height: 7px; margin: 0 0 2px 0; }\n"
+        ".gmux-tab-scrollbar slider { min-height: 7px; }\n"
+        ".gmux-tab-item { margin: 0; padding: 0; border-radius: 0; }\n"
         ".gmux-tab-item-active { background-color: alpha(@theme_selected_bg_color, 0.55); }\n"
         ".gmux-tab-item-active > button { color: @theme_selected_fg_color; }\n"
-        ".gmux-tab-header > box > .gmux-tab-item > button,"
-        ".gmux-tab-header > box > button,"
-        ".gmux-tab-header > button {"
+        ".gmux-tab-item > button:not(.gmux-tab-close),"
+        ".gmux-tab-add-button {"
         "  background: none; border: none; box-shadow: none;"
         "  border-radius: 0; padding: 3px 8px; margin: 0; min-height: 28px;"
         "  font-size: 0.85em;"
@@ -894,7 +1162,6 @@ static void apply_ui_theme(AppState *app) {
         ".gmux-tab-close {"
         "  background: none; border: none; box-shadow: none;"
         "  min-height: 28px; min-width: 22px;"
-        "  max-height: 28px; max-width: 22px;"
         "  padding: 3px 6px; margin: 0;"
         "  opacity: 0.4; border-radius: 3px;"
         "  -gtk-icon-size: 12px;"
@@ -902,6 +1169,7 @@ static void apply_ui_theme(AppState *app) {
         ".gmux-tab-item-active > .gmux-tab-close { opacity: 0.75; }\n"
         ".gmux-tab-close:hover { opacity: 1.0; background-color: alpha(@theme_fg_color, 0.16); }\n"
         ".gmux-tab-dragging { opacity: 0.5; }\n"
+        ".gmux-tab-overflow-indicator { margin: 0 6px 0 2px; opacity: 0.6; }\n"
         "window.background.csd,"
         "window.background.csd decoration { border-radius: 0; }\n"
     );
@@ -1043,8 +1311,29 @@ static void apply_ui_theme(AppState *app) {
         "  padding: 0;"
         "}\n", s_sidebar, s_fg);
     g_string_append_printf(css,
+        ".gmux-tabs-scroller,"
+        ".gmux-tabs-scroller > viewport {"
+        "  background: none; background-color: transparent; border: none;"
+        "}\n");
+    g_string_append_printf(css,
+        ".gmux-tab-scrollbar {"
+        "  background: transparent;"
+        "  min-height: 7px;"
+        "  margin: 0 0 2px 0;"
+        "}\n");
+    g_string_append_printf(css,
+        ".gmux-tab-scrollbar slider {"
+        "  background-color: alpha(%s, 0.28);"
+        "  min-height: 7px;"
+        "  border-radius: 999px;"
+        "}\n", s_fg);
+    g_string_append_printf(css,
+        ".gmux-tab-scrollbar slider:hover {"
+        "  background-color: alpha(%s, 0.42);"
+        "}\n", s_fg);
+    g_string_append_printf(css,
         ".gmux-tab-item {"
-        "  margin: 0; padding: 0; spacing: 0; border-radius: 0;"
+        "  margin: 0; padding: 0; border-radius: 0;"
         "  transition: background-color 150ms ease;"
         "}\n");
     g_string_append_printf(css,
@@ -1052,21 +1341,19 @@ static void apply_ui_theme(AppState *app) {
     g_string_append_printf(css,
         ".gmux-tab-item-active > button { color: %s; }\n", s_fg);
     g_string_append_printf(css,
-        ".gmux-tab-header > box > .gmux-tab-item > button,"
-        ".gmux-tab-header > box > button,"
+        ".gmux-tab-item > button:not(.gmux-tab-close),"
         ".gmux-tab-header > button {"
         "  background: none; color: %s; border: none; box-shadow: none;"
         "  border-radius: 0; padding: 3px 8px; margin: 0; min-height: 28px;"
         "  font-size: 0.85em;"
         "}\n", s_fg_dim);
     g_string_append_printf(css,
-        ".gmux-tab-header > box > .gmux-tab-item > button:hover,"
-        ".gmux-tab-header > box > button:hover { background-color: transparent; }\n");
+        ".gmux-tab-item > button:not(.gmux-tab-close):hover,"
+        ".gmux-tab-add-button:hover { background-color: transparent; }\n");
     g_string_append_printf(css,
         ".gmux-tab-close {"
         "  background: none; border: none; box-shadow: none;"
         "  min-height: 28px; min-width: 22px;"
-        "  max-height: 28px; max-width: 22px;"
         "  padding: 3px 6px; margin: 0;"
         "  opacity: 0.4;"
         "  border-radius: 3px;"
@@ -1081,6 +1368,12 @@ static void apply_ui_theme(AppState *app) {
         ".gmux-tab-close:hover { opacity: 1.0; background-color: alpha(%s, 0.2); }\n", s_fg);
     g_string_append_printf(css,
         ".gmux-tab-dragging { opacity: 0.5; }\n");
+    g_string_append_printf(css,
+        ".gmux-tab-overflow-indicator {"
+        "  color: %s;"
+        "  margin: 0 6px 0 2px;"
+        "  opacity: 0.7;"
+        "}\n", s_fg_dim);
 
     // Misc
     g_string_append_printf(css,
@@ -1162,21 +1455,127 @@ static void apply_ui_theme(AppState *app) {
 // Settings Panel
 //=============================================================================
 
-static void on_theme_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec,
-                                      gpointer user_data) {
+static guint get_theme_dropdown_index(const char *selected_name) {
+    for (size_t i = 0; i < BUILTIN_THEME_COUNT; i++) {
+        if (g_strcmp0(selected_name, builtin_themes[i].name) == 0)
+            return (guint)i;
+    }
+    return 0;
+}
+
+static void on_day_theme_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec,
+                                          gpointer user_data) {
     (void)pspec;
     AppState *app = (AppState *)user_data;
+
+    if (app->settings_dialog_closing) {
+        debug_log("day_theme_dropdown_changed ignored settings_dialog_closing=1");
+        return;
+    }
 
     guint sel = gtk_drop_down_get_selected(dropdown);
     if (sel == GTK_INVALID_LIST_POSITION || sel >= BUILTIN_THEME_COUNT) return;
 
     const char *name = builtin_themes[sel].name;
-    if (g_strcmp0(app->theme_name, name) == 0) return;
+    debug_log("day_theme_dropdown_changed sel=%u name=%s", sel, name);
+    if (g_strcmp0(app->settings.day_theme_name, name) == 0) return;
 
-    save_theme_name(name);
-    load_builtin_theme(app, name);
-    apply_theme_to_all_terminals(app);
-    apply_ui_theme(app);
+    g_free(app->settings.day_theme_name);
+    app->settings.day_theme_name = g_strdup(name);
+    save_terminal_settings(&app->settings);
+
+    if (is_day_theme_active_now(&app->settings)) {
+        app->theme_preview_active = TRUE;
+        debug_log("day_theme_dropdown_changed applying active day theme=%s", name);
+        apply_theme_name_now(app, name);
+    } else {
+        debug_log("day_theme_dropdown_changed deferred inactive day theme=%s", name);
+    }
+}
+
+static void on_night_theme_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec,
+                                            gpointer user_data) {
+    (void)pspec;
+    AppState *app = (AppState *)user_data;
+
+    if (app->settings_dialog_closing) {
+        debug_log("night_theme_dropdown_changed ignored settings_dialog_closing=1");
+        return;
+    }
+
+    guint sel = gtk_drop_down_get_selected(dropdown);
+    if (sel == GTK_INVALID_LIST_POSITION || sel >= BUILTIN_THEME_COUNT) return;
+
+    const char *name = builtin_themes[sel].name;
+    debug_log("night_theme_dropdown_changed sel=%u name=%s", sel, name);
+    if (g_strcmp0(app->settings.night_theme_name, name) == 0) return;
+
+    g_free(app->settings.night_theme_name);
+    app->settings.night_theme_name = g_strdup(name);
+    save_terminal_settings(&app->settings);
+
+    if (!is_day_theme_active_now(&app->settings)) {
+        app->theme_preview_active = TRUE;
+        debug_log("night_theme_dropdown_changed applying active night theme=%s", name);
+        apply_theme_name_now(app, name);
+    } else {
+        debug_log("night_theme_dropdown_changed deferred inactive night theme=%s", name);
+    }
+}
+
+static void on_schedule_time_changed(GtkSpinButton *spin, gpointer user_data) {
+    (void)user_data;
+    AppState *app = (AppState *)g_object_get_data(G_OBJECT(spin), "gmux-app");
+    if (app->settings_dialog_closing) {
+        debug_log("schedule_time_changed ignored settings_dialog_closing=1");
+        return;
+    }
+    GtkSpinButton *hour_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(spin), "gmux-hour-spin"));
+    GtkSpinButton *minute_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(spin), "gmux-minute-spin"));
+    gboolean is_day = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(spin), "gmux-is-day-schedule"));
+    int minutes = gtk_spin_button_get_value_as_int(hour_spin) * 60 +
+                  gtk_spin_button_get_value_as_int(minute_spin);
+
+    if (is_day)
+        app->settings.day_start_minutes = clamp_minutes(minutes);
+    else
+        app->settings.night_start_minutes = clamp_minutes(minutes);
+
+    debug_log("schedule_time_changed is_day=%d value=%02d:%02d preview=%d",
+              is_day,
+              minutes / 60, minutes % 60,
+              app->theme_preview_active);
+    save_terminal_settings(&app->settings);
+    if (!app->theme_preview_active)
+        queue_theme_refresh(app);
+}
+
+static GtkWidget* build_time_control(AppState *app, int minutes, gboolean is_day) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
+    GtkWidget *hour_spin = gtk_spin_button_new_with_range(0, 23, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(hour_spin), minutes / 60);
+    gtk_widget_set_size_request(hour_spin, 70, -1);
+
+    GtkWidget *separator = gtk_label_new(":");
+
+    GtkWidget *minute_spin = gtk_spin_button_new_with_range(0, 59, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(minute_spin), minutes % 60);
+    gtk_widget_set_size_request(minute_spin, 70, -1);
+
+    GtkWidget *spins[] = { hour_spin, minute_spin };
+    for (size_t i = 0; i < G_N_ELEMENTS(spins); i++) {
+        g_object_set_data(G_OBJECT(spins[i]), "gmux-app", app);
+        g_object_set_data(G_OBJECT(spins[i]), "gmux-hour-spin", hour_spin);
+        g_object_set_data(G_OBJECT(spins[i]), "gmux-minute-spin", minute_spin);
+        g_object_set_data(G_OBJECT(spins[i]), "gmux-is-day-schedule", GINT_TO_POINTER(is_day));
+        g_signal_connect(spins[i], "value-changed", G_CALLBACK(on_schedule_time_changed), NULL);
+    }
+
+    gtk_box_append(GTK_BOX(box), hour_spin);
+    gtk_box_append(GTK_BOX(box), separator);
+    gtk_box_append(GTK_BOX(box), minute_spin);
+    return box;
 }
 
 static GtkWidget* build_theme_section(AppState *app) {
@@ -1185,28 +1584,58 @@ static GtkWidget* build_theme_section(AppState *app) {
     gtk_widget_set_margin_end(section, 16);
     gtk_widget_set_margin_top(section, 16);
 
-    GtkWidget *heading = gtk_label_new("Theme");
+    GtkWidget *heading = gtk_label_new("Appearance");
     gtk_label_set_xalign(GTK_LABEL(heading), 0.0);
     gtk_widget_add_css_class(heading, "gmux-settings-heading");
     gtk_box_append(GTK_BOX(section), heading);
 
-    // Build theme name list and find active index
-    GtkStringList *names = gtk_string_list_new(NULL);
-    guint active_idx = 0;
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 10);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
 
+    GtkStringList *names = gtk_string_list_new(NULL);
     for (size_t i = 0; i < BUILTIN_THEME_COUNT; i++) {
         gtk_string_list_append(names, builtin_themes[i].name);
-        if (g_strcmp0(app->theme_name, builtin_themes[i].name) == 0)
-            active_idx = (guint)i;
     }
 
-    GtkWidget *dropdown = gtk_drop_down_new(G_LIST_MODEL(names), NULL);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(dropdown), active_idx);
+    GtkWidget *day_label = gtk_label_new("Day Theme");
+    gtk_label_set_xalign(GTK_LABEL(day_label), 0.0);
+    gtk_widget_set_hexpand(day_label, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), day_label, 0, 0, 1, 1);
 
-    g_signal_connect(dropdown, "notify::selected",
-                     G_CALLBACK(on_theme_dropdown_changed), app);
+    GtkWidget *day_dropdown = gtk_drop_down_new(G_LIST_MODEL(names), NULL);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(day_dropdown),
+                               get_theme_dropdown_index(app->settings.day_theme_name));
+    g_signal_connect(day_dropdown, "notify::selected",
+                     G_CALLBACK(on_day_theme_dropdown_changed), app);
+    gtk_grid_attach(GTK_GRID(grid), day_dropdown, 1, 0, 1, 1);
 
-    gtk_box_append(GTK_BOX(section), dropdown);
+    GtkWidget *night_label = gtk_label_new("Night Theme");
+    gtk_label_set_xalign(GTK_LABEL(night_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), night_label, 0, 1, 1, 1);
+
+    GtkWidget *night_dropdown = gtk_drop_down_new(G_LIST_MODEL(names), NULL);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(night_dropdown),
+                               get_theme_dropdown_index(app->settings.night_theme_name));
+    g_signal_connect(night_dropdown, "notify::selected",
+                     G_CALLBACK(on_night_theme_dropdown_changed), app);
+    gtk_grid_attach(GTK_GRID(grid), night_dropdown, 1, 1, 1, 1);
+
+    GtkWidget *day_start_label = gtk_label_new("Day Starts");
+    gtk_label_set_xalign(GTK_LABEL(day_start_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), day_start_label, 0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid),
+                    build_time_control(app, app->settings.day_start_minutes, TRUE),
+                    1, 2, 1, 1);
+
+    GtkWidget *night_start_label = gtk_label_new("Night Starts");
+    gtk_label_set_xalign(GTK_LABEL(night_start_label), 0.0);
+    gtk_grid_attach(GTK_GRID(grid), night_start_label, 0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid),
+                    build_time_control(app, app->settings.night_start_minutes, FALSE),
+                    1, 3, 1, 1);
+
+    gtk_box_append(GTK_BOX(section), grid);
     return section;
 }
 
@@ -1424,7 +1853,7 @@ static GtkWidget* build_about_section(void) {
     gtk_label_set_xalign(GTK_LABEL(title), 0.5);
     gtk_box_append(GTK_BOX(section), title);
 
-    GtkWidget *version = gtk_label_new("Version 0.1.0");
+    GtkWidget *version = gtk_label_new(gmux_build_version());
     gtk_label_set_xalign(GTK_LABEL(version), 0.5);
     gtk_widget_add_css_class(version, "gmux-about-dim");
     gtk_box_append(GTK_BOX(section), version);
@@ -1433,11 +1862,6 @@ static GtkWidget* build_about_section(void) {
     gtk_label_set_xalign(GTK_LABEL(built_with), 0.5);
     gtk_widget_add_css_class(built_with, "gmux-about-dim");
     gtk_box_append(GTK_BOX(section), built_with);
-
-    GtkWidget *created = gtk_label_new("Created with Claude, AI by Anthropic");
-    gtk_label_set_xalign(GTK_LABEL(created), 0.5);
-    gtk_widget_add_css_class(created, "gmux-about-dim");
-    gtk_box_append(GTK_BOX(section), created);
 
     GtkWidget *link_btn = gtk_button_new_with_label("github.com/mehmetkocer");
     gtk_widget_set_halign(link_btn, GTK_ALIGN_CENTER);
@@ -1448,16 +1872,77 @@ static GtkWidget* build_about_section(void) {
     return section;
 }
 
+static gboolean on_settings_dialog_close_request(GtkWindow *window, gpointer user_data) {
+    AppState *app = (AppState *)user_data;
+    app->settings_dialog_closing = TRUE;
+    debug_log("settings_dialog close-request window=%p current=%s preview=%d day=%s night=%s",
+              (void *)window,
+              app->theme_name ? app->theme_name : "(null)",
+              app->theme_preview_active,
+              app->settings.day_theme_name ? app->settings.day_theme_name : "(null)",
+              app->settings.night_theme_name ? app->settings.night_theme_name : "(null)");
+    gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
+    return TRUE;
+}
+
+static void on_settings_dialog_hide(GtkWidget *widget, gpointer user_data) {
+    AppState *app = (AppState *)user_data;
+    debug_log("settings_dialog hide widget=%p current=%s preview=%d",
+              (void *)widget,
+              app->theme_name ? app->theme_name : "(null)",
+              app->theme_preview_active);
+    app->theme_preview_active = FALSE;
+    app->settings_dialog_closing = FALSE;
+}
+
+static void on_settings_dialog_destroy(GtkWidget *widget, gpointer user_data) {
+    AppState *app = (AppState *)user_data;
+    debug_log("settings_dialog destroy widget=%p current=%s preview=%d idle=%u",
+              (void *)widget,
+              app->theme_name ? app->theme_name : "(null)",
+              app->theme_preview_active,
+              app->theme_refresh_idle_id);
+
+    if (app->theme_refresh_idle_id > 0) {
+        g_source_remove(app->theme_refresh_idle_id);
+        app->theme_refresh_idle_id = 0;
+    }
+
+    if (app->settings_dialog == widget)
+        app->settings_dialog = NULL;
+
+    app->theme_preview_active = FALSE;
+    app->settings_dialog_closing = FALSE;
+    debug_log("settings_dialog destroy complete preview=%d", app->theme_preview_active);
+}
+
 static void on_settings_clicked(GtkButton *button, gpointer user_data) {
     AppState *app = (AppState *)user_data;
     (void)button;
 
+    if (app->settings_dialog) {
+        debug_log("settings_dialog reuse window=%p", (void *)app->settings_dialog);
+        gtk_window_present(GTK_WINDOW(app->settings_dialog));
+        return;
+    }
+
     GtkWidget *dialog = gtk_window_new();
+    app->settings_dialog = dialog;
     gtk_window_set_title(GTK_WINDOW(dialog), "Settings");
     gtk_window_set_default_size(GTK_WINDOW(dialog), 400, 550);
     gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
     gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(app->window));
+    gtk_window_set_hide_on_close(GTK_WINDOW(dialog), TRUE);
     gtk_widget_add_css_class(dialog, "gmux-settings");
+    app->settings_dialog_closing = FALSE;
+    debug_log("settings_dialog open window=%p current=%s day=%s night=%s",
+              (void *)dialog,
+              app->theme_name ? app->theme_name : "(null)",
+              app->settings.day_theme_name ? app->settings.day_theme_name : "(null)",
+              app->settings.night_theme_name ? app->settings.night_theme_name : "(null)");
+    g_signal_connect(dialog, "close-request", G_CALLBACK(on_settings_dialog_close_request), app);
+    g_signal_connect(dialog, "hide", G_CALLBACK(on_settings_dialog_hide), app);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(on_settings_dialog_destroy), app);
 
     GtkWidget *scrolled = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
@@ -1563,13 +2048,60 @@ static void on_terminal_child_exited(VteTerminal *terminal, int status, gpointer
 // SubTab Management
 //=============================================================================
 
+static void sync_terminal_size_from_widget(SubTab *subtab) {
+    if (!subtab || !subtab->terminal) {
+        return;
+    }
+
+    GtkWidget *widget = GTK_WIDGET(subtab->terminal);
+    int width = gtk_widget_get_width(widget);
+    int height = gtk_widget_get_height(widget);
+    glong char_width = vte_terminal_get_char_width(subtab->terminal);
+    glong char_height = vte_terminal_get_char_height(subtab->terminal);
+
+    if (width <= 0 || height <= 0 || char_width <= 0 || char_height <= 0) {
+        return;
+    }
+
+    int columns = MAX(1, width / (int)char_width);
+    int rows = MAX(1, height / (int)char_height);
+    VtePty *pty = vte_terminal_get_pty(subtab->terminal);
+
+    if (!pty) {
+        return;
+    }
+
+    int current_rows = 0;
+    int current_columns = 0;
+    if (vte_pty_get_size(pty, &current_rows, &current_columns, NULL) &&
+        current_rows == rows &&
+        current_columns == columns) {
+        return;
+    }
+
+    vte_pty_set_size(pty, rows, columns, NULL);
+}
+
+static void on_terminal_widget_size_changed(GObject *object, GParamSpec *pspec, gpointer user_data) {
+    (void)object;
+    (void)pspec;
+    sync_terminal_size_from_widget((SubTab *)user_data);
+}
+
+static void on_terminal_char_size_changed(VteTerminal *terminal, guint width, guint height, gpointer user_data) {
+    (void)terminal;
+    (void)width;
+    (void)height;
+    sync_terminal_size_from_widget((SubTab *)user_data);
+}
+
 static void on_subtab_button_clicked(GtkButton *button, gpointer user_data) {
     SubTab *subtab = (SubTab *)user_data;
     Project *project = subtab->parent_tab;
     (void)button;
 
     // Switch to this subtab in the stack
-    gtk_stack_set_visible_child(GTK_STACK(project->terminal_stack), subtab->scrolled);
+    gtk_stack_set_visible_child(GTK_STACK(project->terminal_stack), subtab->container);
     project->active_subtab = subtab;
 
     // Update tab styles - active state is on the whole tab row
@@ -1584,6 +2116,9 @@ static void on_subtab_button_clicked(GtkButton *button, gpointer user_data) {
             gtk_widget_remove_css_class(row, "gmux-tab-item-active");
         }
     }
+
+    scroll_subtab_into_view(project, subtab);
+    update_tab_overflow_indicator(project);
 
     // Focus the terminal
     gtk_widget_grab_focus(GTK_WIDGET(subtab->terminal));
@@ -1602,6 +2137,88 @@ static void update_tab_count_badge(Project *project) {
     } else {
         gtk_widget_set_visible(project->tab_count_label, FALSE);
     }
+}
+
+static void update_tab_overflow_indicator(Project *project) {
+    if (!project || !project->tabs_hadjustment || !project->tabs_overflow_indicator) {
+        return;
+    }
+
+    double value = gtk_adjustment_get_value(project->tabs_hadjustment);
+    double upper = gtk_adjustment_get_upper(project->tabs_hadjustment);
+    double page_size = gtk_adjustment_get_page_size(project->tabs_hadjustment);
+    gboolean has_overflow = (upper - page_size) > 1.0;
+    gboolean hidden_tabs_on_right = (upper - (value + page_size)) > 1.0;
+
+    if (project->tabs_scrollbar) {
+        gtk_widget_set_visible(project->tabs_scrollbar, has_overflow);
+    }
+    gtk_widget_set_visible(project->tabs_overflow_indicator, hidden_tabs_on_right);
+}
+
+static void scroll_subtab_into_view(Project *project, SubTab *subtab) {
+    if (!project || !subtab || !project->tabs_hadjustment || !subtab->tab_widget) {
+        return;
+    }
+
+    graphene_rect_t bounds;
+    if (!gtk_widget_compute_bounds(subtab->tab_widget, project->tabs_box, &bounds)) {
+        return;
+    }
+
+    gtk_adjustment_clamp_page(
+        project->tabs_hadjustment,
+        bounds.origin.x,
+        bounds.origin.x + bounds.size.width
+    );
+}
+
+static void on_tabs_adjustment_changed(GtkAdjustment *adjustment, gpointer user_data) {
+    (void)adjustment;
+    update_tab_overflow_indicator((Project *)user_data);
+}
+
+static void on_tabs_layout_changed(GObject *object, GParamSpec *pspec, gpointer user_data) {
+    (void)object;
+    (void)pspec;
+    update_tab_overflow_indicator((Project *)user_data);
+}
+
+static gboolean on_tabs_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data) {
+    Project *project = (Project *)user_data;
+    (void)controller;
+
+    if (!project || !project->tabs_hadjustment) {
+        return FALSE;
+    }
+
+    double upper = gtk_adjustment_get_upper(project->tabs_hadjustment);
+    double page_size = gtk_adjustment_get_page_size(project->tabs_hadjustment);
+    if ((upper - page_size) <= 1.0) {
+        return FALSE;
+    }
+
+    double delta = fabs(dx) > 0.0 ? dx : dy;
+    if (fabs(delta) < 0.001) {
+        return FALSE;
+    }
+
+    double lower = gtk_adjustment_get_lower(project->tabs_hadjustment);
+    double max_value = upper - page_size;
+    double step = gtk_adjustment_get_step_increment(project->tabs_hadjustment);
+    if (step <= 0.0) {
+        step = MAX(page_size * 0.25, 60.0);
+    }
+
+    double new_value = gtk_adjustment_get_value(project->tabs_hadjustment) + (delta * step);
+    new_value = CLAMP(new_value, lower, max_value);
+
+    if (fabs(new_value - gtk_adjustment_get_value(project->tabs_hadjustment)) < 0.001) {
+        return FALSE;
+    }
+
+    gtk_adjustment_set_value(project->tabs_hadjustment, new_value);
+    return TRUE;
 }
 
 static void close_subtab(SubTab *subtab) {
@@ -1631,7 +2248,7 @@ static void close_subtab(SubTab *subtab) {
     gtk_box_remove(GTK_BOX(project->tabs_box), subtab->tab_widget);
 
     // Remove terminal from stack
-    gtk_stack_remove(GTK_STACK(project->terminal_stack), subtab->scrolled);
+    gtk_stack_remove(GTK_STACK(project->terminal_stack), subtab->container);
 
     // Remove from subtab list
     project->subtabs = g_list_remove(project->subtabs, subtab);
@@ -1653,6 +2270,7 @@ static void close_subtab(SubTab *subtab) {
     }
 
     update_tab_count_badge(project);
+    update_tab_overflow_indicator(project);
     save_session(project->app);
 }
 
@@ -1809,6 +2427,10 @@ static void on_tab_drag_end(GtkGestureDrag *gesture, double offset_x, double off
     if (dragged_btn && active) {
         gtk_widget_remove_css_class(dragged_btn, "gmux-tab-dragging");
         rebuild_subtabs_list(project);
+        if (project->active_subtab) {
+            scroll_subtab_into_view(project, project->active_subtab);
+        }
+        update_tab_overflow_indicator(project);
         save_session(project->app);
     }
 
@@ -1839,6 +2461,8 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
     vte_terminal_set_mouse_autohide(subtab->terminal, TRUE);
     vte_terminal_set_allow_hyperlink(subtab->terminal, TRUE);
     setup_url_matching(subtab->terminal);
+    gtk_widget_set_hexpand(GTK_WIDGET(subtab->terminal), TRUE);
+    gtk_widget_set_vexpand(GTK_WIDGET(subtab->terminal), TRUE);
 
     // Ctrl+click to open URLs
     GtkGesture *click = gtk_gesture_click_new();
@@ -1846,24 +2470,32 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
     g_signal_connect(click, "pressed", G_CALLBACK(on_terminal_clicked), subtab->terminal);
     gtk_widget_add_controller(GTK_WIDGET(subtab->terminal), GTK_EVENT_CONTROLLER(click));
 
-    // Make terminal scrollable
-    subtab->scrolled = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(subtab->scrolled),
-                                   GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(subtab->scrolled), GTK_WIDGET(subtab->terminal));
+    // VteTerminal is incompatible with GtkScrolledWindow; use its own
+    // vertical adjustment with an explicit scrollbar so width changes keep
+    // propagating down to the PTY.
+    subtab->container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_hexpand(subtab->container, TRUE);
+    gtk_widget_set_vexpand(subtab->container, TRUE);
+    gtk_box_append(GTK_BOX(subtab->container), GTK_WIDGET(subtab->terminal));
 
-    gtk_widget_set_hexpand(subtab->scrolled, TRUE);
-    gtk_widget_set_vexpand(subtab->scrolled, TRUE);
+    GtkAdjustment *vadjustment = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(subtab->terminal));
+    GtkWidget *scrollbar = gtk_scrollbar_new(GTK_ORIENTATION_VERTICAL, vadjustment);
+    gtk_box_append(GTK_BOX(subtab->container), scrollbar);
 
     // Connect signals
     g_signal_connect(subtab->terminal, "window-title-changed",
                      G_CALLBACK(on_terminal_title_changed), subtab);
     g_signal_connect(subtab->terminal, "child-exited",
                      G_CALLBACK(on_terminal_child_exited), subtab);
+    g_signal_connect(subtab->terminal, "notify::width",
+                     G_CALLBACK(on_terminal_widget_size_changed), subtab);
+    g_signal_connect(subtab->terminal, "notify::height",
+                     G_CALLBACK(on_terminal_widget_size_changed), subtab);
+    g_signal_connect(subtab->terminal, "char-size-changed",
+                     G_CALLBACK(on_terminal_char_size_changed), subtab);
 
     // Add to stack
-    gtk_stack_add_child(GTK_STACK(project->terminal_stack), subtab->scrolled);
+    gtk_stack_add_child(GTK_STACK(project->terminal_stack), subtab->container);
 
     // Create tab row with separate select and close buttons
     subtab->tab_widget = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -1940,9 +2572,12 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
             vte_terminal_set_cursor_blink_mode(subtab->terminal, (VteCursorBlinkMode)s->cursor_blink);
     }
 
+    sync_terminal_size_from_widget(subtab);
+
     printf("Created subtab: %s\n", name);
 
     update_tab_count_badge(project);
+    update_tab_overflow_indicator(project);
 
     return subtab;
 }
@@ -2034,26 +2669,70 @@ static Project* create_project(AppState *app, const char *name, const char *path
     gtk_widget_set_hexpand(project->tab_container, TRUE);
     gtk_widget_set_vexpand(project->tab_container, TRUE);
 
-    // Create tab header (horizontal box for tabs + plus button)
-    project->tab_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    // Create tab header (top row + optional scrollbar row)
+    project->tab_header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(project->tab_header, "gmux-tab-header");
+    GtkWidget *tab_header_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
     // Create tabs box (for individual tab buttons)
     project->tabs_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(project->tabs_box, TRUE);
+    gtk_widget_set_halign(project->tabs_box, GTK_ALIGN_START);
+
+    project->tabs_scroller = gtk_scrolled_window_new();
+    gtk_widget_add_css_class(project->tabs_scroller, "gmux-tabs-scroller");
+    gtk_widget_set_hexpand(project->tabs_scroller, TRUE);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(project->tabs_scroller),
+                                   GTK_POLICY_EXTERNAL, GTK_POLICY_NEVER);
+    gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(project->tabs_scroller), FALSE);
+    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(project->tabs_scroller), FALSE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(project->tabs_scroller), project->tabs_box);
+
+    project->tabs_hadjustment =
+        gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(project->tabs_scroller));
+    g_signal_connect(project->tabs_hadjustment, "changed",
+                     G_CALLBACK(on_tabs_adjustment_changed), project);
+    g_signal_connect(project->tabs_hadjustment, "value-changed",
+                     G_CALLBACK(on_tabs_adjustment_changed), project);
+    g_signal_connect(project->tabs_scroller, "notify::width",
+                     G_CALLBACK(on_tabs_layout_changed), project);
+    g_signal_connect(project->tabs_box, "notify::width",
+                     G_CALLBACK(on_tabs_layout_changed), project);
+
+    project->tabs_scrollbar = gtk_scrollbar_new(GTK_ORIENTATION_HORIZONTAL, project->tabs_hadjustment);
+    gtk_widget_add_css_class(project->tabs_scrollbar, "gmux-tab-scrollbar");
+    gtk_widget_set_hexpand(project->tabs_scrollbar, TRUE);
+    gtk_widget_set_visible(project->tabs_scrollbar, FALSE);
+
+    GtkEventController *tabs_scroll =
+        gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES |
+                                        GTK_EVENT_CONTROLLER_SCROLL_DISCRETE);
+    gtk_event_controller_set_propagation_phase(tabs_scroll, GTK_PHASE_CAPTURE);
+    g_signal_connect(tabs_scroll, "scroll", G_CALLBACK(on_tabs_scroll), project);
+    gtk_widget_add_controller(tab_header_row, tabs_scroll);
 
     // Enable gesture-based tab reordering
     setup_tabs_box_drag_reorder(project);
 
+    project->tabs_overflow_indicator = gtk_image_new_from_icon_name("go-next-symbolic");
+    gtk_widget_add_css_class(project->tabs_overflow_indicator, "gmux-tab-overflow-indicator");
+    gtk_widget_set_tooltip_text(project->tabs_overflow_indicator, "More tabs to the right");
+    gtk_widget_set_visible(project->tabs_overflow_indicator, FALSE);
+
     // Create plus button for adding new tabs
     GtkWidget *add_subtab_button = gtk_button_new_from_icon_name("list-add-symbolic");
+    gtk_widget_add_css_class(add_subtab_button, "gmux-tab-add-button");
     gtk_widget_set_tooltip_text(add_subtab_button, "Add new tab");
     g_signal_connect(add_subtab_button, "clicked",
                      G_CALLBACK(on_add_subtab_clicked), project);
 
-    // Add tabs box and plus button to header
-    gtk_box_append(GTK_BOX(project->tab_header), project->tabs_box);
-    gtk_box_append(GTK_BOX(project->tab_header), add_subtab_button);
+    // Add tabs scroller, overflow indicator, and plus button to top row,
+    // then place the scrollbar underneath so it doesn't overlap the tabs.
+    gtk_box_append(GTK_BOX(tab_header_row), project->tabs_scroller);
+    gtk_box_append(GTK_BOX(tab_header_row), project->tabs_overflow_indicator);
+    gtk_box_append(GTK_BOX(tab_header_row), add_subtab_button);
+    gtk_box_append(GTK_BOX(project->tab_header), tab_header_row);
+    gtk_box_append(GTK_BOX(project->tab_header), project->tabs_scrollbar);
 
     // Create stack for terminal content
     project->terminal_stack = gtk_stack_new();
@@ -2208,6 +2887,15 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
     AppState *app = (AppState *)user_data;
     (void)widget;
 
+    if (app->theme_schedule_timer_id > 0) {
+        g_source_remove(app->theme_schedule_timer_id);
+        app->theme_schedule_timer_id = 0;
+    }
+    if (app->theme_refresh_idle_id > 0) {
+        g_source_remove(app->theme_refresh_idle_id);
+        app->theme_refresh_idle_id = 0;
+    }
+
     save_window_geometry(app);
     save_session(app);
 
@@ -2232,6 +2920,8 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
 
     // Clean up settings resources
     g_free(app->settings.font_family);
+    g_free(app->settings.day_theme_name);
+    g_free(app->settings.night_theme_name);
 
     // Clean up theme resources
     if (app->theme.font) {
@@ -2381,24 +3071,28 @@ static void activate(GtkApplication *app, gpointer user_data) {
     // Migrate old config data to XDG data dir
     migrate_config_to_data();
 
-    // Load built-in theme before creating projects
-    char *saved_theme = load_theme_name();
-    load_builtin_theme(state, saved_theme ? saved_theme : "Dracula");
-    g_free(saved_theme);
     load_terminal_settings(&state->settings);
-    apply_ui_theme(state);
+    refresh_scheduled_theme(state);
+    state->theme_schedule_timer_id = g_timeout_add_seconds(30, on_theme_schedule_tick, state);
 
     // Restore session (projects, subtabs, sort mode)
     load_session(state);
     apply_sort(state);
 
     // Apply settings overrides after projects are loaded
+    refresh_scheduled_theme(state);
     apply_settings_overrides(state);
 
     gtk_window_present(GTK_WINDOW(state->window));
 }
 
 int main(int argc, char *argv[]) {
+    if (argc > 1 &&
+        (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        puts(gmux_build_version());
+        return 0;
+    }
+
     GtkApplication *app = gtk_application_new("com.gmux.terminal",
                                              G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);

@@ -35,6 +35,14 @@ gmux is now fully functional with a clean VTE-based implementation.
 - Tab names update automatically when terminal sets title
 - Falls back to "Terminal N" naming
 
+✅ **Horizontal terminal sub-tabs**
+- Tabs are shown horizontally at the top of each terminal area
+- Active tab auto-scrolls into view when the row overflows
+- A dedicated horizontal scrollbar appears below the tabs only when needed
+- GTK4 note: this external scrollbar layout depends on `GtkScrolledWindow`
+  using `GTK_POLICY_EXTERNAL` horizontally so overflow sizing and the shared
+  adjustment continue to work correctly
+
 ✅ **Stable and reliable**
 - No crashes or segfaults
 - Proper GTK4 event handling
@@ -73,10 +81,11 @@ gmux/
 ### High Priority
 
 #### 1. Horizontal Tab Support in Terminals
-- Add built-in tab support within each terminal
-- Show tabs horizontally at the top of each terminal area
+- Improve terminal sub-tab UX further
+- Keep horizontal tabs polished and robust under resize/overflow
 - Allow Ctrl+Shift+T to create new tabs within a terminal
 - Each terminal instance can have multiple tabs
+- Continue refining tab scrolling, drag-reorder, and overflow behavior
 
 #### 2. Theme Support
 - Theme picker UI in preferences
