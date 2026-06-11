@@ -146,6 +146,10 @@ static void refresh_scheduled_theme(AppState *app);
 static void queue_theme_refresh(AppState *app);
 
 static void debug_log(const char *fmt, ...) {
+    const char *enabled = g_getenv("GMUX_DEBUG");
+    if (!enabled || enabled[0] == '\0' || strcmp(enabled, "0") == 0)
+        return;
+
     va_list args;
     va_start(args, fmt);
     printf("[gmux-debug %lld] ", (long long)(g_get_monotonic_time() / 1000));
@@ -153,6 +157,34 @@ static void debug_log(const char *fmt, ...) {
     printf("\n");
     fflush(stdout);
     va_end(args);
+}
+
+static GdkRGBA mix_rgba(GdkRGBA a, GdkRGBA b, double amount) {
+    if (amount < 0.0) amount = 0.0;
+    if (amount > 1.0) amount = 1.0;
+
+    return (GdkRGBA) {
+        .red = a.red + (b.red - a.red) * amount,
+        .green = a.green + (b.green - a.green) * amount,
+        .blue = a.blue + (b.blue - a.blue) * amount,
+        .alpha = a.alpha + (b.alpha - a.alpha) * amount,
+    };
+}
+
+static char* compact_project_path(const char *path) {
+    if (!path || path[0] == '\0')
+        return g_strdup("");
+
+    const char *home = g_get_home_dir();
+    if (home && home[0] != '\0') {
+        size_t home_len = strlen(home);
+        if (strncmp(path, home, home_len) == 0 &&
+            (path[home_len] == '/' || path[home_len] == '\0')) {
+            return g_strconcat("~", path + home_len, NULL);
+        }
+    }
+
+    return g_strdup(path);
 }
 
 //=============================================================================
@@ -782,7 +814,6 @@ static int sort_func_insertion(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointe
     Project *p1 = (Project *)g_object_get_data(G_OBJECT(row1), "project");
     Project *p2 = (Project *)g_object_get_data(G_OBJECT(row2), "project");
     if (!p1 || !p2) return 0;
-    printf("[sort] insertion: %s(%d) vs %s(%d)\n", p1->name, p1->insert_order, p2->name, p2->insert_order);
     if (p1->insert_order != p2->insert_order) {
         return p1->insert_order < p2->insert_order ? -1 : 1;
     }
@@ -798,7 +829,6 @@ static int sort_func_alpha(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointer us
     if (result == 0) {
         result = compare_project_tiebreak(p1, p2, row1, row2);
     }
-    printf("[sort] alpha: %s vs %s = %d\n", p1->name, p2->name, result);
     return result;
 }
 
@@ -812,8 +842,6 @@ static int sort_func_mru(GtkListBoxRow *row1, GtkListBoxRow *row2, gpointer user
     if (p2->last_used > p1->last_used) result = 1;
     else if (p2->last_used < p1->last_used) result = -1;
     else result = compare_project_tiebreak(p1, p2, row1, row2);
-    printf("[sort] mru: %s(%" G_GINT64_FORMAT ") vs %s(%" G_GINT64_FORMAT ") = %d\n",
-           p1->name, p1->last_used, p2->name, p2->last_used, result);
     return result;
 }
 
@@ -841,25 +869,20 @@ static void update_sort_button(AppState *app) {
 }
 
 static void apply_sort(AppState *app) {
-    const char *mode_name;
     switch (app->sort_mode) {
         case SORT_ALPHA:
-            mode_name = "ALPHA";
             gtk_list_box_set_sort_func(GTK_LIST_BOX(app->sidebar),
                                        sort_func_alpha, app, NULL);
             break;
         case SORT_MRU:
-            mode_name = "MRU";
             gtk_list_box_set_sort_func(GTK_LIST_BOX(app->sidebar),
                                        sort_func_mru, app, NULL);
             break;
         default:
-            mode_name = "NONE";
             gtk_list_box_set_sort_func(GTK_LIST_BOX(app->sidebar),
                                        sort_func_insertion, app, NULL);
             break;
     }
-    printf("[sort] apply_sort: mode=%s, n_projects=%d\n", mode_name, g_list_length(app->projects));
     gtk_list_box_invalidate_sort(GTK_LIST_BOX(app->sidebar));
     update_sort_button(app);
 }
@@ -869,13 +892,11 @@ static void on_sort_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
 
     // Cycle: NONE -> ALPHA -> MRU -> NONE
-    SortMode old = app->sort_mode;
     switch (app->sort_mode) {
         case SORT_NONE:  app->sort_mode = SORT_ALPHA; break;
         case SORT_ALPHA: app->sort_mode = SORT_MRU;   break;
         case SORT_MRU:   app->sort_mode = SORT_NONE;  break;
     }
-    printf("[sort] on_sort_clicked: %d -> %d\n", old, app->sort_mode);
     apply_sort(app);
     save_session(app);
 }
@@ -993,7 +1014,6 @@ static void load_builtin_theme(AppState *app, const char *name) {
     g_free(app->theme_name);
     app->theme_name = g_strdup(name);
 
-    printf("Loaded built-in theme: %s\n", name);
 }
 
 static void apply_theme_name_now(AppState *app, const char *name) {
@@ -1136,40 +1156,42 @@ static void apply_ui_theme(AppState *app) {
     GString *css = g_string_new("");
 
     g_string_append(css,
-        ".gmux-headerbar { min-height: 28px; padding-top: 2px; padding-bottom: 2px; box-shadow: none; }\n"
+        ".gmux-headerbar { min-height: 28px; padding: 2px 4px; box-shadow: none; }\n"
         ".gmux-headerbar button:not(.titlebutton),"
         ".gmux-headerbar button.flat:not(.titlebutton) {"
-        "  min-height: 22px; min-width: 22px; padding: 2px; border-radius: 0;"
+        "  min-height: 22px; min-width: 22px; padding: 2px; border-radius: 3px;"
         "}\n"
-        ".gmux-toolbar { padding: 4px 2px; }\n"
+        ".gmux-toolbar { padding: 4px 6px; }\n"
         ".gmux-toolbar button {"
-        "  border-radius: 0; padding: 0 10px;"
-        "  min-height: 40px; min-width: 40px;"
+        "  border-radius: 3px; padding: 0;"
+        "  min-height: 24px; min-width: 24px;"
+        "  -gtk-icon-size: 14px;"
         "}\n"
-        ".gmux-tab-header { padding: 0; }\n"
+        ".gmux-tab-header { padding: 0 2px; }\n"
         ".gmux-tabs-scroller, .gmux-tabs-scroller > viewport { background: none; border: none; }\n"
-        ".gmux-tab-scrollbar { min-height: 7px; margin: 0 0 2px 0; }\n"
-        ".gmux-tab-scrollbar slider { min-height: 7px; }\n"
-        ".gmux-tab-item { margin: 0; padding: 0; border-radius: 0; }\n"
+        ".gmux-tab-scrollbar { min-height: 4px; margin: 0 4px 2px 4px; }\n"
+        ".gmux-tab-scrollbar slider { min-height: 4px; }\n"
+        ".gmux-tab-item { margin: 1px 0 0 0; padding: 0; border-radius: 2px 2px 0 0; }\n"
         ".gmux-tab-item-active { background-color: alpha(@theme_selected_bg_color, 0.55); }\n"
         ".gmux-tab-item-active > button { color: @theme_selected_fg_color; }\n"
         ".gmux-tab-item > button:not(.gmux-tab-close),"
         ".gmux-tab-add-button {"
         "  background: none; border: none; box-shadow: none;"
-        "  border-radius: 0; padding: 3px 8px; margin: 0; min-height: 28px;"
+        "  border-radius: 2px; padding: 2px 8px; margin: 0; min-height: 25px;"
         "  font-size: 0.85em;"
         "}\n"
         ".gmux-tab-close {"
         "  background: none; border: none; box-shadow: none;"
-        "  min-height: 28px; min-width: 22px;"
-        "  padding: 3px 6px; margin: 0;"
-        "  opacity: 0.4; border-radius: 3px;"
+        "  min-height: 25px; min-width: 22px;"
+        "  padding: 2px 5px; margin: 0;"
+        "  opacity: 0.34; border-radius: 2px;"
         "  -gtk-icon-size: 12px;"
         "}\n"
-        ".gmux-tab-item-active > .gmux-tab-close { opacity: 0.75; }\n"
+        ".gmux-tab-item-active > .gmux-tab-close { opacity: 0.58; }\n"
         ".gmux-tab-close:hover { opacity: 1.0; background-color: alpha(@theme_fg_color, 0.16); }\n"
         ".gmux-tab-dragging { opacity: 0.5; }\n"
         ".gmux-tab-overflow-indicator { margin: 0 6px 0 2px; opacity: 0.6; }\n"
+        ".gmux-terminal-pane, .gmux-terminal-pane > * { border: none; box-shadow: none; outline: none; }\n"
         "window.background.csd,"
         "window.background.csd decoration { border-radius: 0; }\n"
     );
@@ -1186,23 +1208,41 @@ static void apply_ui_theme(AppState *app) {
     double luminance = 0.299 * bg.red + 0.587 * bg.green + 0.114 * bg.blue;
     gboolean is_dark = luminance < 0.5;
 
-    // Scale channels proportionally to preserve hue and saturation.
-    // Multiplying all channels by the same factor keeps their ratio identical.
-    double s1 = is_dark ? 1.3  : 0.85;  // sidebar — slightly lighter/darker than bg
-    double s3 = is_dark ? 1.6  : 0.70;  // button hover
+    GdkRGBA slate_bg = { 0.145, 0.165, 0.205, 1.0 };
+    GdkRGBA slate_raised = { 0.180, 0.205, 0.250, 1.0 };
+    GdkRGBA slate_fg = { 0.780, 0.820, 0.880, 1.0 };
+    GdkRGBA ui_base = is_dark ? mix_rgba(bg, slate_bg, 0.72) : bg;
+    GdkRGBA ui_fg = is_dark ? mix_rgba(fg, slate_fg, 0.42) : fg;
 
-    GdkRGBA sidebar_bg = { fmin(bg.red*s1,1), fmin(bg.green*s1,1), fmin(bg.blue*s1,1), 1.0 };
-    GdkRGBA toolbar_bg = bg;  // title bar / toolbar = exact terminal background color
-    GdkRGBA btn_hover  = { fmin(bg.red*s3,1), fmin(bg.green*s3,1), fmin(bg.blue*s3,1), 1.0 };
-    GdkRGBA fg_dim     = { fg.red*0.7 + bg.red*0.3, fg.green*0.7 + bg.green*0.3, fg.blue*0.7 + bg.blue*0.3, 1.0 };
-    GdkRGBA accent     = theme->palette[4]; accent.alpha = 0.4;
+    GdkRGBA sidebar_bg = is_dark ? mix_rgba(ui_base, slate_raised, 0.38) : mix_rgba(bg, fg, 0.045);
+    GdkRGBA toolbar_bg = is_dark ? mix_rgba(ui_base, slate_raised, 0.20) : mix_rgba(bg, fg, 0.028);
+    GdkRGBA header_bg  = is_dark ? mix_rgba(ui_base, slate_raised, 0.14) : mix_rgba(bg, fg, 0.020);
+    GdkRGBA tab_bg     = is_dark ? mix_rgba(ui_base, ui_fg, 0.075) : mix_rgba(bg, fg, 0.035);
+    GdkRGBA selected_bg = is_dark ? mix_rgba(ui_base, ui_fg, 0.105) : mix_rgba(bg, fg, 0.060);
+    GdkRGBA hover_bg   = is_dark ? mix_rgba(ui_base, ui_fg, 0.075) : mix_rgba(bg, fg, 0.045);
+    GdkRGBA btn_hover  = is_dark ? mix_rgba(ui_base, ui_fg, 0.105) : mix_rgba(bg, fg, 0.070);
+    GdkRGBA separator  = is_dark ? mix_rgba(ui_base, ui_fg, 0.145) : mix_rgba(bg, fg, 0.160);
+    GdkRGBA scrollbar  = is_dark ? mix_rgba(ui_base, ui_fg, 0.240) : mix_rgba(bg, fg, 0.260);
+    GdkRGBA fg_dim     = is_dark ? mix_rgba(ui_fg, ui_base, 0.28) : mix_rgba(fg, bg, 0.32);
+    GdkRGBA fg_muted   = is_dark ? mix_rgba(ui_fg, ui_base, 0.46) : mix_rgba(fg, bg, 0.48);
+    GdkRGBA fg_faint   = is_dark ? mix_rgba(ui_fg, ui_base, 0.62) : mix_rgba(fg, bg, 0.62);
+    GdkRGBA accent     = is_dark ? mix_rgba(theme->palette[4], slate_fg, 0.36) : theme->palette[4];
+    accent.alpha = 1.0;
 
     char *s_bg       = gdk_rgba_to_string(&bg);
-    char *s_fg       = gdk_rgba_to_string(&fg);
+    char *s_fg       = gdk_rgba_to_string(&ui_fg);
     char *s_sidebar  = gdk_rgba_to_string(&sidebar_bg);
     char *s_toolbar  = gdk_rgba_to_string(&toolbar_bg);
+    char *s_header   = gdk_rgba_to_string(&header_bg);
+    char *s_tab_bg   = gdk_rgba_to_string(&tab_bg);
+    char *s_selected = gdk_rgba_to_string(&selected_bg);
+    char *s_row_hover = gdk_rgba_to_string(&hover_bg);
     char *s_hover    = gdk_rgba_to_string(&btn_hover);
+    char *s_separator = gdk_rgba_to_string(&separator);
+    char *s_scrollbar = gdk_rgba_to_string(&scrollbar);
     char *s_fg_dim   = gdk_rgba_to_string(&fg_dim);
+    char *s_fg_muted = gdk_rgba_to_string(&fg_muted);
+    char *s_fg_faint = gdk_rgba_to_string(&fg_faint);
     char *s_accent   = gdk_rgba_to_string(&accent);
 
     // Window
@@ -1219,11 +1259,10 @@ static void apply_ui_theme(AppState *app) {
         "  background-color: %s;"
         "  color: %s;"
         "  min-height: 28px;"
-        "  padding-top: 2px;"
-        "  padding-bottom: 2px;"
-        "  border-bottom: 1px solid alpha(%s, 0.25);"
+        "  padding: 2px 4px;"
+        "  border-bottom: 1px solid %s;"
         "  box-shadow: none;"
-        "}\n", s_toolbar, s_fg, s_fg);
+        "}\n", s_header, s_fg, s_separator);
     g_string_append_printf(css,
         ".gmux-headerbar label,"
         ".gmux-headerbar windowtitle label { color: %s; font-size: 0.9em; }\n", s_fg_dim);
@@ -1234,16 +1273,21 @@ static void apply_ui_theme(AppState *app) {
         "  color: %s; box-shadow: none;"
         "  min-height: 22px; min-width: 22px;"
         "  padding: 2px;"
-        "  border-radius: 0;"
+        "  border-radius: 3px;"
+        "  transition: background-color 120ms ease, color 120ms ease;"
         "}\n", s_fg_dim);
     g_string_append_printf(css,
-        ".gmux-headerbar button:not(.titlebutton):hover {"
+        ".gmux-headerbar button:not(.titlebutton):hover,"
+        ".gmux-headerbar button.flat:not(.titlebutton):hover {"
         "  background-color: %s;"
         "}\n", s_hover);
 
     // Sidebar
     g_string_append_printf(css,
-        ".gmux-sidebar { background-color: %s; }\n", s_sidebar);
+        ".gmux-sidebar {"
+        "  background-color: %s;"
+        "  border-right: 1px solid %s;"
+        "}\n", s_sidebar, s_separator);
     g_string_append_printf(css,
         ".gmux-sidebar scrolledwindow,"
         ".gmux-sidebar scrolledwindow > viewport { background: none; background-color: transparent; }\n");
@@ -1254,62 +1298,82 @@ static void apply_ui_theme(AppState *app) {
         ".gmux-sidebar list > row,"
         ".gmux-sidebar listbox > row {"
         "  background: none; background-color: transparent; color: %s;"
-        "  margin: 0; border-radius: 0;"
-        "  transition: background-color 150ms ease;"
+        "  margin: 1px 5px;"
+        "  border-radius: 3px;"
+        "  border-left: 2px solid transparent;"
+        "  transition: background-color 120ms ease, border-color 120ms ease;"
         "}\n", s_fg);
     g_string_append_printf(css,
         ".gmux-sidebar list > row:hover,"
-        ".gmux-sidebar listbox > row:hover { background-color: alpha(%s, 0.08); }\n", s_fg);
+        ".gmux-sidebar listbox > row:hover { background-color: %s; }\n", s_row_hover);
     g_string_append_printf(css,
         ".gmux-sidebar list > row:selected,"
-        ".gmux-sidebar listbox > row:selected { background-color: %s; }\n", s_accent);
+        ".gmux-sidebar listbox > row:selected {"
+        "  background-color: %s;"
+        "  border-left-color: %s;"
+        "}\n", s_selected, s_accent);
     g_string_append_printf(css,
-        ".gmux-sidebar label { color: %s; }\n", s_fg);
+        ".gmux-project-row { padding: 5px 6px 5px 8px; }\n"
+        ".gmux-project-copy { min-width: 0; }\n"
+        ".gmux-project-name { color: %s; font-size: 0.92em; font-weight: 500; }\n"
+        ".gmux-project-meta { color: %s; font-size: 0.74em; }\n"
+        ".gmux-sidebar label { color: %s; }\n", s_fg_dim, s_fg_faint, s_fg_dim);
+    g_string_append_printf(css,
+        ".gmux-sidebar list > row:selected .gmux-project-name,"
+        ".gmux-sidebar listbox > row:selected .gmux-project-name { color: %s; font-weight: 600; }\n", s_fg);
+    g_string_append_printf(css,
+        ".gmux-sidebar list > row:selected .gmux-project-meta,"
+        ".gmux-sidebar listbox > row:selected .gmux-project-meta { color: %s; }\n", s_fg_muted);
     g_string_append_printf(css,
         ".gmux-sidebar button {"
         "  background: none; color: %s; border: none; box-shadow: none;"
-        "  border-radius: 0; padding: 2px; min-height: 20px; min-width: 20px;"
-        "  opacity: 0.6;"
-        "}\n", s_fg);
+        "  border-radius: 3px; padding: 1px; min-height: 22px; min-width: 22px;"
+        "  opacity: 0.56;"
+        "  -gtk-icon-size: 12px;"
+        "  transition: background-color 120ms ease, color 120ms ease, opacity 120ms ease;"
+        "}\n", s_fg_dim);
     g_string_append_printf(css,
-        ".gmux-sidebar button:hover { background-color: %s; opacity: 1.0; }\n", s_hover);
+        ".gmux-sidebar button:hover { background-color: %s; color: %s; opacity: 1.0; }\n", s_hover, s_fg);
     g_string_append_printf(css,
         ".gmux-tab-count {"
-        "  background-color: alpha(%s, 0.25);"
         "  color: %s;"
-        "  border-radius: 8px;"
-        "  padding: 3px 5px;"
+        "  background-color: transparent;"
+        "  border-radius: 3px;"
+        "  padding: 1px 3px;"
         "  min-height: 0;"
         "  min-width: 0;"
-        "  font-size: 11px;"
-        "  font-weight: 600;"
+        "  font-size: 0.74em;"
+        "  font-weight: 500;"
         "  margin: 0;"
         "  line-height: 1;"
-        "}\n", s_fg, s_fg);
+        "}\n", s_fg_faint);
 
     // Toolbar — with subtle bottom separator
     g_string_append_printf(css,
         ".gmux-toolbar {"
         "  background-color: %s;"
-        "  border-bottom: 2px solid alpha(%s, 0.35);"
-        "  padding: 4px 2px;"
-        "}\n", s_toolbar, s_fg);
+        "  border-bottom: 1px solid %s;"
+        "  padding: 4px 6px;"
+        "}\n", s_toolbar, s_separator);
     g_string_append_printf(css,
         ".gmux-toolbar button {"
         "  background: none; color: %s; border: none; box-shadow: none;"
-        "  border-radius: 0; padding: 0 6px;"
-        "  min-height: 28px; min-width: 28px;"
-        "}\n", s_fg_dim);
+        "  border-radius: 3px; padding: 0;"
+        "  margin: 0 1px;"
+        "  min-height: 24px; min-width: 24px;"
+        "  -gtk-icon-size: 14px;"
+        "  transition: background-color 120ms ease, color 120ms ease;"
+        "}\n", s_fg_muted);
     g_string_append_printf(css,
-        ".gmux-toolbar button:hover { background-color: %s; }\n", s_hover);
+        ".gmux-toolbar button:hover { background-color: %s; color: %s; }\n", s_hover, s_fg);
 
     // Tab header
     g_string_append_printf(css,
         ".gmux-tab-header {"
         "  background-color: %s;"
-        "  border-bottom: 1px solid alpha(%s, 0.25);"
-        "  padding: 0;"
-        "}\n", s_sidebar, s_fg);
+        "  border-bottom: 1px solid %s;"
+        "  padding: 0 2px;"
+        "}\n", s_sidebar, s_separator);
     g_string_append_printf(css,
         ".gmux-tabs-scroller,"
         ".gmux-tabs-scroller > viewport {"
@@ -1318,51 +1382,67 @@ static void apply_ui_theme(AppState *app) {
     g_string_append_printf(css,
         ".gmux-tab-scrollbar {"
         "  background: transparent;"
-        "  min-height: 7px;"
-        "  margin: 0 0 2px 0;"
+        "  min-height: 4px;"
+        "  margin: 0 4px 2px 4px;"
         "}\n");
     g_string_append_printf(css,
         ".gmux-tab-scrollbar slider {"
-        "  background-color: alpha(%s, 0.28);"
-        "  min-height: 7px;"
+        "  background-color: %s;"
+        "  min-height: 4px;"
         "  border-radius: 999px;"
-        "}\n", s_fg);
+        "}\n", s_scrollbar);
     g_string_append_printf(css,
         ".gmux-tab-scrollbar slider:hover {"
-        "  background-color: alpha(%s, 0.42);"
-        "}\n", s_fg);
+        "  background-color: %s;"
+        "}\n", s_fg_faint);
     g_string_append_printf(css,
         ".gmux-tab-item {"
-        "  margin: 0; padding: 0; border-radius: 0;"
-        "  transition: background-color 150ms ease;"
+        "  background-color: transparent;"
+        "  margin: 1px 0 0 0;"
+        "  padding: 0;"
+        "  border-radius: 2px 2px 0 0;"
+        "  border-top: 2px solid transparent;"
+        "  border-left: 1px solid transparent;"
+        "  border-right: 1px solid transparent;"
+        "  transition: background-color 120ms ease, border-color 120ms ease;"
         "}\n");
     g_string_append_printf(css,
-        ".gmux-tab-item-active { background-color: %s; }\n", s_accent);
+        ".gmux-tab-item:hover { background-color: %s; }\n", s_row_hover);
+    g_string_append_printf(css,
+        ".gmux-tab-item-active {"
+        "  background-color: %s;"
+        "  border-top-color: %s;"
+        "  border-left-color: %s;"
+        "  border-right-color: %s;"
+        "}\n", s_tab_bg, s_accent, s_separator, s_separator);
     g_string_append_printf(css,
         ".gmux-tab-item-active > button { color: %s; }\n", s_fg);
     g_string_append_printf(css,
         ".gmux-tab-item > button:not(.gmux-tab-close),"
-        ".gmux-tab-header > button {"
+        ".gmux-tab-header > button,"
+        ".gmux-tab-add-button {"
         "  background: none; color: %s; border: none; box-shadow: none;"
-        "  border-radius: 0; padding: 3px 8px; margin: 0; min-height: 28px;"
+        "  border-radius: 2px; padding: 2px 8px; margin: 0; min-height: 25px;"
         "  font-size: 0.85em;"
-        "}\n", s_fg_dim);
+        "  transition: background-color 120ms ease, color 120ms ease;"
+        "}\n", s_fg_muted);
     g_string_append_printf(css,
         ".gmux-tab-item > button:not(.gmux-tab-close):hover,"
-        ".gmux-tab-add-button:hover { background-color: transparent; }\n");
+        ".gmux-tab-add-button:hover { background-color: %s; color: %s; }\n", s_hover, s_fg);
     g_string_append_printf(css,
         ".gmux-tab-close {"
         "  background: none; border: none; box-shadow: none;"
-        "  min-height: 28px; min-width: 22px;"
-        "  padding: 3px 6px; margin: 0;"
-        "  opacity: 0.4;"
-        "  border-radius: 3px;"
+        "  min-height: 25px; min-width: 22px;"
+        "  padding: 2px 5px; margin: 0;"
+        "  opacity: 0.34;"
+        "  border-radius: 2px;"
         "  color: %s;"
         "  -gtk-icon-size: 12px;"
-        "}\n", s_fg);
+        "  transition: background-color 120ms ease, opacity 120ms ease;"
+        "}\n", s_fg_muted);
     g_string_append_printf(css,
         ".gmux-tab-item-active > .gmux-tab-close {"
-        "  background-color: transparent; color: %s; opacity: 0.75;"
+        "  background-color: transparent; color: %s; opacity: 0.58;"
         "}\n", s_fg);
     g_string_append_printf(css,
         ".gmux-tab-close:hover { opacity: 1.0; background-color: alpha(%s, 0.2); }\n", s_fg);
@@ -1374,20 +1454,50 @@ static void apply_ui_theme(AppState *app) {
         "  margin: 0 6px 0 2px;"
         "  opacity: 0.7;"
         "}\n", s_fg_dim);
+    g_string_append_printf(css,
+        ".gmux-terminal-pane {"
+        "  background-color: %s;"
+        "  border: none;"
+        "  box-shadow: none;"
+        "  outline: none;"
+        "}\n", s_bg);
+    g_string_append_printf(css,
+        ".gmux-terminal-pane > * {"
+        "  border: none;"
+        "  box-shadow: none;"
+        "  outline: none;"
+        "}\n");
+    g_string_append_printf(css,
+        ".gmux-terminal-scrollbar {"
+        "  background-color: %s;"
+        "  border: none;"
+        "  margin: 0;"
+        "}\n", s_bg);
 
     // Misc
     g_string_append_printf(css,
-        "notebook > header { background-color: %s; }\n", s_bg);
+        "notebook {"
+        "  background-color: %s;"
+        "  border: none;"
+        "  box-shadow: none;"
+        "}\n", s_bg);
     g_string_append_printf(css,
-        "paned > separator { min-width: 1px; background-color: alpha(%s, 0.25); }\n", s_fg);
+        "notebook > header,"
+        "notebook > stack {"
+        "  background-color: %s;"
+        "  border: none;"
+        "  box-shadow: none;"
+        "}\n", s_bg);
+    g_string_append_printf(css,
+        "paned > separator { min-width: 1px; background-color: %s; }\n", s_separator);
     g_string_append_printf(css,
         "scrollbar { background: transparent; }\n"
         "scrollbar slider {"
-        "  background-color: alpha(%s, 0.2); min-width: 4px; min-height: 4px;"
+        "  background-color: %s; min-width: 4px; min-height: 4px;"
         "  border-radius: 0; border: 2px solid transparent;"
-        "}\n", s_fg);
+        "}\n", s_scrollbar);
     g_string_append_printf(css,
-        "scrollbar slider:hover { background-color: alpha(%s, 0.4); }\n", s_fg);
+        "scrollbar slider:hover { background-color: %s; }\n", s_fg_faint);
 
     // Settings dialog theming
     g_string_append_printf(css,
@@ -1446,8 +1556,16 @@ static void apply_ui_theme(AppState *app) {
     g_free(s_fg);
     g_free(s_sidebar);
     g_free(s_toolbar);
+    g_free(s_header);
+    g_free(s_tab_bg);
+    g_free(s_selected);
+    g_free(s_row_hover);
     g_free(s_hover);
+    g_free(s_separator);
+    g_free(s_scrollbar);
     g_free(s_fg_dim);
+    g_free(s_fg_muted);
+    g_free(s_fg_faint);
     g_free(s_accent);
 }
 
@@ -2025,6 +2143,7 @@ static void on_terminal_title_changed(VteTerminal *terminal, gpointer user_data)
 
         if (subtab->tab_label && GTK_IS_LABEL(subtab->tab_label)) {
             gtk_label_set_text(GTK_LABEL(subtab->tab_label), subtab->name);
+            gtk_widget_set_tooltip_text(subtab->tab_label, subtab->name);
         }
     }
 }
@@ -2253,8 +2372,6 @@ static void close_subtab(SubTab *subtab) {
     // Remove from subtab list
     project->subtabs = g_list_remove(project->subtabs, subtab);
 
-    printf("Closed subtab: %s\n", subtab->name);
-
     // If this was the active tab and no adjacent tab was selected, clear active state
     if (project->active_subtab == subtab) {
         project->active_subtab = NULL;
@@ -2474,12 +2591,14 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
     // vertical adjustment with an explicit scrollbar so width changes keep
     // propagating down to the PTY.
     subtab->container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(subtab->container, "gmux-terminal-pane");
     gtk_widget_set_hexpand(subtab->container, TRUE);
     gtk_widget_set_vexpand(subtab->container, TRUE);
     gtk_box_append(GTK_BOX(subtab->container), GTK_WIDGET(subtab->terminal));
 
     GtkAdjustment *vadjustment = gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(subtab->terminal));
     GtkWidget *scrollbar = gtk_scrollbar_new(GTK_ORIENTATION_VERTICAL, vadjustment);
+    gtk_widget_add_css_class(scrollbar, "gmux-terminal-scrollbar");
     gtk_box_append(GTK_BOX(subtab->container), scrollbar);
 
     // Connect signals
@@ -2503,6 +2622,10 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
 
     subtab->tab_button = gtk_button_new();
     subtab->tab_label = gtk_label_new(name);
+    gtk_label_set_ellipsize(GTK_LABEL(subtab->tab_label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_single_line_mode(GTK_LABEL(subtab->tab_label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(subtab->tab_label), 34);
+    gtk_widget_set_tooltip_text(subtab->tab_label, name);
     gtk_button_set_child(GTK_BUTTON(subtab->tab_button), subtab->tab_label);
     g_signal_connect(subtab->tab_button, "clicked",
                      G_CALLBACK(on_subtab_button_clicked), subtab);
@@ -2574,8 +2697,6 @@ static SubTab* create_subtab(Project *project, const char *name, const char *wor
 
     sync_terminal_size_from_widget(subtab);
 
-    printf("Created subtab: %s\n", name);
-
     update_tab_count_badge(project);
     update_tab_overflow_indicator(project);
 
@@ -2590,12 +2711,9 @@ static void on_project_selected(GtkListBox *box, GtkListBoxRow *row, gpointer us
     AppState *app = (AppState *)user_data;
     (void)box;
 
-    printf("[sort] on_project_selected: row=%p\n", (void *)row);
     if (!row) return;
 
     Project *project = (Project *)g_object_get_data(G_OBJECT(row), "project");
-    printf("[sort] on_project_selected: project=%s, sort_mode=%d\n",
-           project ? project->name : "NULL", app->sort_mode);
     if (project) {
         int page_num = g_list_index(app->projects, project);
         if (page_num >= 0) {
@@ -2747,30 +2865,52 @@ static Project* create_project(AppState *app, const char *name, const char *path
     gtk_notebook_append_page(GTK_NOTEBOOK(app->notebook), project->tab_container, NULL);
     gtk_notebook_set_show_tabs(GTK_NOTEBOOK(app->notebook), FALSE);
 
-    // Create sidebar row: horizontal box with label + "+" button
+    // Create sidebar row: project text, quiet tab count, and add button.
     GtkWidget *row_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(row_box, "gmux-project-row");
+
+    GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(text_box, "gmux-project-copy");
+    gtk_widget_set_hexpand(text_box, TRUE);
 
     GtkWidget *label = gtk_label_new(name);
+    gtk_widget_add_css_class(label, "gmux-project-name");
     gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+    gtk_label_set_single_line_mode(GTK_LABEL(label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(label), 20);
+    gtk_widget_set_tooltip_text(label, path);
     gtk_widget_set_hexpand(label, TRUE);
-    gtk_widget_set_margin_start(label, 12);
-    gtk_widget_set_margin_top(label, 8);
-    gtk_widget_set_margin_bottom(label, 8);
+
+    char *path_display = compact_project_path(path);
+    GtkWidget *meta_label = gtk_label_new(path_display);
+    gtk_widget_add_css_class(meta_label, "gmux-project-meta");
+    gtk_label_set_xalign(GTK_LABEL(meta_label), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(meta_label), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_single_line_mode(GTK_LABEL(meta_label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(meta_label), 22);
+    gtk_widget_set_tooltip_text(meta_label, path);
+    gtk_widget_set_hexpand(meta_label, TRUE);
+    g_free(path_display);
+
+    gtk_box_append(GTK_BOX(text_box), label);
+    gtk_box_append(GTK_BOX(text_box), meta_label);
 
     // Tab count badge (hidden until terminals are created)
     project->tab_count_label = gtk_label_new("");
     gtk_widget_add_css_class(project->tab_count_label, "gmux-tab-count");
     gtk_widget_set_visible(project->tab_count_label, FALSE);
     gtk_widget_set_valign(project->tab_count_label, GTK_ALIGN_CENTER);
-    gtk_widget_set_margin_end(project->tab_count_label, 4);
+    gtk_widget_set_margin_start(project->tab_count_label, 6);
+    gtk_widget_set_margin_end(project->tab_count_label, 3);
 
     GtkWidget *row_add_button = gtk_button_new_from_icon_name("list-add-symbolic");
     gtk_widget_set_tooltip_text(row_add_button, "New terminal in this project");
-    gtk_widget_set_margin_end(row_add_button, 6);
+    gtk_widget_set_valign(row_add_button, GTK_ALIGN_CENTER);
     g_signal_connect(row_add_button, "clicked",
                      G_CALLBACK(on_sidebar_add_subtab_clicked), project);
 
-    gtk_box_append(GTK_BOX(row_box), label);
+    gtk_box_append(GTK_BOX(row_box), text_box);
     gtk_box_append(GTK_BOX(row_box), project->tab_count_label);
     gtk_box_append(GTK_BOX(row_box), row_add_button);
 
@@ -2797,8 +2937,6 @@ static Project* create_project(AppState *app, const char *name, const char *path
         gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), page_num);
         gtk_list_box_select_row(GTK_LIST_BOX(app->sidebar), GTK_LIST_BOX_ROW(project->list_row));
     }
-
-    printf("Created project: %s (%s)\n", name, path);
 
     return project;
 }
